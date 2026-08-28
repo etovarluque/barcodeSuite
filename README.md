@@ -24,11 +24,11 @@ The app opens a single window with six independent tabs:
 
 | | |
 | --- | --- |
-| ![FASTQ Inspector](screenshots/screenshot1_bs.png) | ![FASTA Tools](screenshots/screenshot2_bs.png) |
+| ![FASTQ Inspector](screenshots/01-fastq-inspector.png) | ![FASTA Tools](screenshots/02-fasta-tools.png) |
 | *FASTQ Inspector* | *FASTA Tools* |
-| ![FASTA Compare](screenshots/screenshot3_bs.png) | ![BLAST](screenshots/screenshot4_bs.png) |
+| ![FASTA Compare](screenshots/03-fasta-compare.png) | ![BLAST](screenshots/04-blast.png) |
 | *FASTA Compare* | *BLAST NCBI Search* |
-| ![GenBank Batch](screenshots/screenshot5_bs.png) | |
+| ![GenBank Batch](screenshots/05-genbank-batch.png) | |
 | *GenBank Batch Search* | |
 
 ## Requirements

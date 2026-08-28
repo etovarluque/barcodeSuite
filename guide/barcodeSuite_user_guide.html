@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>User Guide · BarcodeSuite (barcodeSuite.py)</title>
+<style>
+  :root{
+    --blue:#185FA5; --blue-dark:#0C4A82; --green:#2E8B57; --amber:#B45309;
+    --red:#DC2626;
+    --bg:#f6f7f9; --card:#ffffff; --line:#e3e6ea;
+    --text:#1a1f29; --text-sec:#5b6675; --text-hint:#8a94a3;
+    --code-bg:#f1f3f6; --side:#111826; --side-text:#c7cfdb; --side-hi:#4d9fff;
+    --shadow:0 1px 3px rgba(0,0,0,.06),0 4px 16px rgba(0,0,0,.05);
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#0f141b; --card:#171d26; --line:#28303c;
+      --text:#e7ebf1; --text-sec:#a9b3c1; --text-hint:#7c8797;
+      --code-bg:#1e2530; --side:#0b0f16; --side-text:#c7cfdb; --side-hi:#5aa9ff;
+      --blue:#4d9fff; --blue-dark:#3d84d6; --green:#4cba7d; --amber:#e0a341;
+      --shadow:0 1px 3px rgba(0,0,0,.4),0 4px 16px rgba(0,0,0,.35);
+    }
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    line-height:1.6; font-size:16px;
+  }
+  .wrap{display:block;}
+  /* Sidebar — pinned to the left edge of the screen */
+  aside{
+    position:fixed; left:0; top:0; height:100vh; overflow-y:auto;
+    width:270px; background:var(--side); color:var(--side-text);
+    padding:26px 20px; font-size:14.5px; z-index:10;
+  }
+  aside .brand{font-size:18px; font-weight:700; color:#fff; margin:0 0 4px;}
+  aside .brand small{display:block; font-size:12px; font-weight:400; color:#8a94a3; margin-top:3px;}
+  aside nav{margin-top:22px;}
+  aside nav a{
+    display:block; color:var(--side-text); text-decoration:none;
+    padding:7px 12px; border-radius:7px; margin-bottom:2px; transition:.15s;
+    border-left:3px solid transparent;
+  }
+  aside nav a:hover{background:rgba(255,255,255,.06); color:#fff;}
+  aside nav a.sub{padding-left:26px; font-size:13.5px; color:#9aa5b4;}
+  aside nav .grp{font-size:11px; text-transform:uppercase; letter-spacing:.09em;
+    color:#6b7686; margin:18px 0 6px 12px;}
+  /* Main — offset to the right of the fixed bar, with a comfortable reading width */
+  main{margin-left:270px; max-width:1010px; padding:44px 52px 90px;}
+  h1{font-size:30px; margin:0 0 6px; letter-spacing:-.4px;}
+  h2{font-size:23px; margin:52px 0 4px; padding-bottom:8px; border-bottom:2px solid var(--line);
+     scroll-margin-top:20px;}
+  h3{font-size:18px; margin:30px 0 6px; color:var(--blue); scroll-margin-top:20px;}
+  h4{font-size:15px; margin:20px 0 4px; color:var(--text);}
+  p{margin:8px 0;}
+  .lead{font-size:18px; color:var(--text-sec); margin-bottom:8px;}
+  .tag{display:inline-block; font-size:12px; font-weight:600; padding:3px 10px;
+    border-radius:20px; background:var(--code-bg); color:var(--text-sec); margin-right:6px;}
+  code{background:var(--code-bg); padding:2px 6px; border-radius:5px;
+    font-family:"SF Mono",Consolas,"Courier New",monospace; font-size:13.5px; color:var(--blue-dark);}
+  @media (prefers-color-scheme: dark){ code{color:var(--side-hi);} }
+  pre{background:var(--code-bg); border:1px solid var(--line); border-radius:9px;
+    padding:14px 16px; overflow-x:auto; margin:12px 0;}
+  pre code{background:none; padding:0; color:var(--text); font-size:13px; line-height:1.55;}
+  ul,ol{margin:8px 0; padding-left:24px;}
+  li{margin:4px 0;}
+  .card{background:var(--card); border:1px solid var(--line); border-radius:12px;
+    padding:20px 24px; margin:18px 0; box-shadow:var(--shadow);}
+  .grid{display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:14px; margin:16px 0;}
+  .mini{background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px;}
+  .mini b{color:var(--blue);}
+  table{width:100%; border-collapse:collapse; margin:14px 0; font-size:14.5px; display:block; overflow-x:auto;}
+  th,td{border:1px solid var(--line); padding:9px 12px; text-align:left; vertical-align:top;}
+  th{background:var(--code-bg); font-weight:600;}
+  tbody tr:nth-child(even){background:rgba(128,128,128,.04);}
+  .note,.warn,.tip{border-radius:9px; padding:12px 16px; margin:14px 0; font-size:14.5px;
+    border-left:4px solid;}
+  .note{background:rgba(24,95,165,.07); border-color:var(--blue);}
+  .warn{background:rgba(180,83,9,.09); border-color:var(--amber);}
+  .tip{background:rgba(46,139,87,.09); border-color:var(--green);}
+  .note b,.warn b,.tip b{display:block; margin-bottom:2px;}
+  .steps{counter-reset:s; list-style:none; padding-left:0;}
+  .steps li{counter-increment:s; position:relative; padding-left:42px; margin:12px 0;}
+  .steps li::before{content:counter(s); position:absolute; left:0; top:0;
+    width:28px; height:28px; border-radius:50%; background:var(--blue); color:#fff;
+    font-weight:700; font-size:14px; display:flex; align-items:center; justify-content:center;}
+  .pill{font-size:12.5px; padding:2px 9px; border-radius:6px; font-weight:600;}
+  .out{background:rgba(46,139,87,.12); color:var(--green);}
+  kbd{background:var(--card); border:1px solid var(--line); border-bottom-width:2px;
+    border-radius:5px; padding:1px 7px; font-size:12.5px; font-family:monospace;}
+  footer.pg{margin-top:70px; padding-top:20px; border-top:1px solid var(--line);
+    color:var(--text-hint); font-size:13px;}
+  @media (max-width:900px){
+    aside{display:none;}
+    main{margin-left:0; max-width:100%; padding:28px 22px 70px;}
+    h1{font-size:25px;}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<aside>
+  <div class="brand">BarcodeSuite
+    <small>User Guide · barcodeSuite.py</small>
+  </div>
+  <nav>
+    <a href="#intro">Introduction</a>
+    <a href="#requirements">Requirements &amp; installation</a>
+    <a href="#interface">Interface concepts</a>
+    <div class="grp">Tabs / Tools</div>
+    <a href="#fastq" class="sub">1 · FASTQ Inspector</a>
+    <a href="#fasta-tools" class="sub">2 · FASTA Tools</a>
+    <a href="#compare" class="sub">3 · FASTA Compare</a>
+    <a href="#blast" class="sub">4 · BLAST NCBI</a>
+    <a href="#genbank" class="sub">5 · GenBank Batch</a>
+    <a href="#bold" class="sub">6 · BOLD Formatter</a>
+    <div class="grp">Extra</div>
+    <a href="#tips">Tips &amp; troubleshooting</a>
+  </nav>
+</aside>
+
+<main>
+
+<h1 id="intro">BarcodeSuite — User Guide</h1>
+<p class="lead">A graphical suite of utilities for working with <b>FASTQ</b> and <b>FASTA</b> files
+in <i>DNA barcoding</i> workflows (compatible with ONTbarcoder / Nanopore, BOLD and GenBank outputs).</p>
+<p>
+  <span class="tag">Graphical interface (PyQt5)</span>
+  <span class="tag">Drag &amp; drop</span>
+  <span class="tag">Windows / cross-platform</span>
+</p>
+
+<div class="card">
+  <p style="margin-top:0"><b>What does this program do?</b> <code>barcodeSuite.py</code> opens a window with
+  <b>six tabs</b>, each an independent tool:</p>
+  <div class="grid">
+    <div class="mini"><b>FASTQ Inspector</b><br>Full descriptive report of a FASTQ file (quality, length, GC, plots).</div>
+    <div class="mini"><b>FASTA Tools</b><br>7 operations on FASTA: unique, identical, grep, filtering, append info, reformat, sort.</div>
+    <div class="mini"><b>FASTA Compare</b><br>Compares multiFASTA files from different runs sample by sample (identical / compatible / different).</div>
+    <div class="mini"><b>BLAST NCBI</b><br>Online BLAST search against NCBI databases with taxonomy.</div>
+    <div class="mini"><b>GenBank Batch</b><br>Batch search in GenBank with up to two crossed criteria: counts, metadata and FASTA.</div>
+    <div class="mini"><b>BOLD Formatter</b><br>Reformats the BOLD "Barcode ID" Excel workbook to the style of the BLAST report.</div>
+  </div>
+</div>
+
+<!-- ============================================================= -->
+<h2 id="requirements">Requirements &amp; installation</h2>
+
+<h3>Python dependencies</h3>
+<p>The program requires Python 3 and the following libraries:</p>
+<pre><code>pip install PyQt5 edlib xlsxwriter openpyxl</code></pre>
+<ul>
+  <li><code>PyQt5</code> — graphical interface.</li>
+  <li><code>edlib</code> — fast sequence alignment (used in the comparison).</li>
+  <li><code>xlsxwriter</code> / <code>openpyxl</code> — reading and writing Excel files (.xlsx).</li>
+</ul>
+<div class="tip"><b>Automatic installation</b>
+When you run <code>python barcodeSuite.py</code> from source, the app checks these four dependencies
+(and <code>pip</code> itself) at startup and automatically installs any that are missing.
+This does not apply to the packaged version (<code>.exe</code>), which already bundles everything.</div>
+
+<h3>Running the program</h3>
+<pre><code># From the project folder
+python barcodeSuite.py</code></pre>
+<div class="note"><b>Icon and title</b>
+If an <code>icon.ico</code> file exists next to the script, it is used as the window and taskbar icon.
+On Windows the app appears as <b>"BarcodeSuite"</b>.</div>
+<div class="tip"><b>Packaged version (.exe)</b>
+The code is prepared to run frozen with PyInstaller (<code>multiprocessing.freeze_support()</code>),
+so it can also be distributed as an executable without needing Python installed.</div>
+
+<!-- ============================================================= -->
+<h2 id="interface">General interface concepts</h2>
+<p>All tabs share the same working logic:</p>
+
+<div class="grid">
+  <div class="mini"><b>🖱️ Drop zone</b><br>Drag files onto the indicated area, or use the
+    <kbd>Browse…</kbd> button to locate them. One or several files are accepted depending on the tool.</div>
+  <div class="mini"><b>⚙️ Options</b><br>Each operation shows its own parameters. They appear and
+    hide depending on what you select.</div>
+  <div class="mini"><b>▶ Run</b><br>The main button (<kbd>Run →</kbd>, <kbd>Start comparison →</kbd>,
+    <kbd>Format →</kbd>) launches the process in the background; a progress bar shows the advance.</div>
+  <div class="mini"><b>📄 Log</b><br>A text panel shows the detail of each operation and the files generated.</div>
+  <div class="mini"><b>📂 Open folder</b><br>When finished, the <kbd>Open folder 📂</kbd> button opens
+    the folder with the results.</div>
+  <div class="mini"><b>🗑️ Clear</b><br>Resets the tab and clears the loaded files.</div>
+</div>
+
+<div class="note"><b>Accepted formats</b>
+FASTA: <code>.fa</code>, <code>.fas</code>, <code>.fasta</code>, <code>.fna</code> (also gzip-compressed <code>.gz</code>).
+FASTQ: <code>.fastq</code>, <code>.fastq.gz</code>. Excel: <code>.xlsx</code>.</div>
+
+<!-- ============================================================= -->
+<h2 id="fastq">1 · FASTQ Inspector</h2>
+<p class="lead">Full descriptive report of a FASTQ file.</p>
+<p>Drag <b>one</b> FASTQ file (<code>.fastq</code> or <code>.fastq.gz</code>) to obtain a statistical
+analysis of every read. Processing is parallel (multiprocessing) for large files.</p>
+
+<h3>Metrics reported</h3>
+<table>
+  <thead><tr><th>Section</th><th>Indicators</th></tr></thead>
+  <tbody>
+    <tr><td><b>General</b></td><td>Total reads · Total bases · File size</td></tr>
+    <tr><td><b>Read length</b></td><td>Min · Max · Mean · Median · <b>N50</b> · counts by range (&lt;500, 500–2000, &gt;2000 bp)</td></tr>
+    <tr><td><b>Base quality (Phred)</b></td><td>Mean Q-score · number of reads with Q≥10, Q≥15, Q≥20</td></tr>
+    <tr><td><b>GC content</b></td><td>Mean %GC · standard deviation of %GC</td></tr>
+  </tbody>
+</table>
+
+<h3>Plots</h3>
+<ul>
+  <li>Read <b>length</b> distribution.</li>
+  <li>Distribution of the <b>mean Q-score</b> per read.</li>
+  <li>Distribution of <b>%GC</b> per read.</li>
+  <li><b>Scatter</b>: length vs. mean Q-score.</li>
+</ul>
+<div class="note"><b>Note</b>
+All reads are analyzed for the statistics; only the scatter plot uses a random sample of
+<b>10,000 points</b> to stay responsive.</div>
+
+<h3>How to use it</h3>
+<ol class="steps">
+  <li>Drag the FASTQ file onto the tab's drop zone.</li>
+  <li>Wait for the analysis to finish (progress bar).</li>
+  <li>Review the statistics cards and the four plots.</li>
+</ol>
+
+<!-- ============================================================= -->
+<h2 id="fasta-tools">2 · FASTA Tools</h2>
+<p class="lead">Seven operations on one or more FASTA files.</p>
+<p>Drag one or more FASTA files and choose the operation. Each operation generates its output file(s)
+in the same folder as the input files.</p>
+
+<div class="note"><b>Merge files</b>
+The <b>"Merge files before processing"</b> checkbox controls the mode:
+<ul style="margin:6px 0 0">
+  <li><b>Checked:</b> all files are concatenated into a single set and the operation is applied to the
+    combined set → a single output.</li>
+  <li><b>Unchecked:</b> each file is processed separately → one output per file.</li>
+</ul></div>
+
+<h3>2.1 · Extract unique sequences</h3>
+<p>Extracts the non-repeated sequences. Output: <span class="pill out"><code>&lt;name&gt;_unique.fasta</code></span></p>
+
+<h3>2.2 · Extract identical sequences (duplicates)</h3>
+<p>Extracts the sequences that appear more than once. Generates two files:</p>
+<ul>
+  <li><span class="pill out"><code>&lt;name&gt;_identical.fasta</code></span> — the duplicated sequences.</li>
+  <li><span class="pill out"><code>&lt;name&gt;_duplicate_groups.xlsx</code></span> — IDs grouped by shared sequence.
+    <ul>
+      <li><b>IDs</b> sheet: list of IDs per group.</li>
+      <li><b>Groups</b> sheet: group number, number of IDs and the sequence.</li>
+    </ul>
+  </li>
+</ul>
+
+<h3>2.3 · Extract sequences by pattern (grep)</h3>
+<p>Filters by a match in the FASTA header. Output: <span class="pill out"><code>&lt;name&gt;_grep.fasta</code></span></p>
+<ul>
+  <li><b>Pattern</b>: type the search text directly, or</li>
+  <li><b>Load patterns from file</b>: load a <code>.txt</code> with <b>one pattern per line</b> (empty lines are ignored).
+    Each pattern is compared against the full header.</li>
+  <li><b>Use regex</b>: interpret each pattern as a regular expression.</li>
+</ul>
+
+<h3>2.4 · Filter by header fields</h3>
+<p>Splits each header by a separator and filters by field position. Output:
+<span class="pill out"><code>&lt;name&gt;_filtered.fasta</code></span></p>
+<ul>
+  <li><b>Field separator:</b> <code>|</code> (pipe), <code>;</code> (semicolon) or a custom one.</li>
+  <li><b>Preview</b>: shows the fields of the first loaded sequence to help locate positions.</li>
+  <li><b>Criteria</b> (several can be added; they are applied with <b>AND</b> logic — all must be met):
+    <ul>
+      <li>Numeric operators: <code>&gt;=</code> <code>&lt;=</code> <code>&gt;</code> <code>&lt;</code> <code>=</code> <code>!=</code></li>
+      <li>Text operators: <code>=</code> <code>!=</code> <code>contains</code> <code>not contains</code></li>
+    </ul>
+  </li>
+</ul>
+
+<h3>2.5 · Append information to headers from .xlsx</h3>
+<p>Adds fields to each header from an Excel file. Output: <span class="pill out"><code>&lt;name&gt;_append.fasta</code></span></p>
+<div class="note"><b>Excel format</b>
+Column 1 = sequence ID (same as the FASTA header, without <code>&gt;</code>);
+columns 2+ = fields to append. Values are normalized: leading/trailing spaces are removed,
+spaces/periods/commas are converted to <code>_</code> and accents are stripped.</div>
+<p><b>Separator</b> used to join the appended fields: <code>|</code> or <code>;</code>.</p>
+
+<h3>2.6 · Reformat sequence lines</h3>
+<ul>
+  <li><b>Multiline → single line</b> (linearize / <i>unwrap</i>): joins the sequence into a single line.</li>
+  <li><b>Single line → multiline</b> (wrap): breaks the sequence every N nucleotides
+    (default <b>80</b>, configurable from 10 to 10,000).</li>
+</ul>
+<p>Output: <span class="pill out"><code>&lt;name&gt;_linearized.fasta</code></span> / <span class="pill out"><code>&lt;name&gt;_wrapped.fasta</code></span></p>
+
+<h3>2.7 · Sort sequences</h3>
+<p>Sorts the sequences by the header or by header fields. Output:
+<span class="pill out"><code>&lt;name&gt;_sorted.fasta</code></span></p>
+<ul>
+  <li><b>Field separator:</b> none (full header), <code>|</code>, <code>;</code> or custom.</li>
+  <li><b>Sort levels:</b> several can be added (multi-key sort, applied top to bottom),
+    each with a field and a direction (ascending/descending).</li>
+</ul>
+
+<!-- ============================================================= -->
+<h2 id="compare">3 · FASTA Compare</h2>
+<p class="lead">Compares multiFASTA files from different runs, sample by sample.</p>
+<p>Use it to contrast the barcodes obtained from the same sample across several runs.
+The <b>sample ID</b> is extracted from the FASTA header and used to pair sequences between files.</p>
+
+<h3>Sample ID extraction</h3>
+<h4>Positional mode (simple)</h4>
+<ul>
+  <li><b>ID delimiter:</b> character (or text) that separates the ID from the rest of the header
+    (<code>_</code> typical of ONT, <code>|</code> for BOLD/GenBank). Multi-character delimiters are supported.</li>
+  <li><b>before occurrence:</b> which occurrence of the delimiter marks the end of the ID (1st, 2nd, …).
+    E.g. with <code>_</code> and "1st" it takes everything before the first <code>_</code>.</li>
+  <li><b>any of these:</b> treats the delimiter field as a <b>set of characters</b> and cuts at the first
+    one that appears. Useful when the same ID is followed by different separators in each file
+    (e.g. <code>_-</code> makes <code>BIOUG00045_all.fa</code> and <code>BIOUG00045-all.fa</code> both yield <code>BIOUG00045</code>).</li>
+  <li>A <b>preview</b> shows the resulting ID live over an example header.</li>
+</ul>
+
+<h4>Advanced mode (Regex)</h4>
+<p>For files with different header conventions:</p>
+<ul>
+  <li><b>Regex (one per line):</b> tried in order until one matches. If it has a capture group,
+    group 1 is used; otherwise the full match. E.g. <code>^(\S+?)_all\.fa</code> , <code>^([^|]+)\|</code></li>
+  <li><b>Normalize ID:</b>
+    <ul>
+      <li><b>lowercase</b> — converts the ID to lowercase.</li>
+      <li><b>strip leading zeros</b> — removes leading zeros within numbers (<code>BIOUG00045 → BIOUG45</code>).</li>
+      <li><b>strip (regex)</b> — removes from the ID whatever matches the regex (useful for stripping run/replicate
+        suffixes, e.g. <code>_S\d+$</code>).</li>
+    </ul>
+  </li>
+</ul>
+<div class="tip"><b>Purpose of normalization</b>
+To make the same sample "collide" (match) across files with different naming conventions.</div>
+
+<h3>Comparison modes</h3>
+<ul>
+  <li><b>Compare sets with each other</b> — compares all sets against each other and classifies each sample as
+    <i>identical / IUPAC-compatible / different / unique</i>.</li>
+  <li><b>Compare against reference</b> — one file acts as reference and the rest are compared against it.</li>
+</ul>
+
+<h3>Output files</h3>
+<p>When starting, the destination folder is requested. The following are generated:</p>
+<table>
+  <thead><tr><th>File</th><th>Content</th></tr></thead>
+  <tbody>
+    <tr><td><code>summary.xlsx</code></td><td>Summary table colored by the status of each sample.</td></tr>
+    <tr><td><code>best_barcodes.fa</code></td><td>The best sequence chosen per sample.</td></tr>
+    <tr><td><code>identical.fa</code></td><td>Samples with an identical sequence across files.</td></tr>
+    <tr><td><code>compatible_iupac.fa</code></td><td>Samples compatible according to IUPAC codes.</td></tr>
+    <tr><td><code>different.fa</code></td><td>Samples with different sequences.</td></tr>
+    <tr><td><code>only_in_reference.fa</code> / <code>without_reference.fa</code></td><td>Reference mode only.</td></tr>
+    <tr><td><code>unique_&lt;file&gt;.fa</code></td><td>Samples present in a single file (one per file).</td></tr>
+  </tbody>
+</table>
+<p>Buttons after finishing: <kbd>Show table ↗</kbd> (view the table in the app), <kbd>Open folder 📂</kbd> and <kbd>Open Excel 📊</kbd>.</p>
+
+<!-- ============================================================= -->
+<h2 id="blast">4 · BLAST NCBI Search</h2>
+<p class="lead">Online BLAST search of your sequences against NCBI databases.</p>
+<p>Drag one or more FASTA files. Results can include the organism and its taxonomic
+classification from NCBI Taxonomy.</p>
+
+<div class="warn"><b>⚠ An NCBI API key is required</b>
+You must register a personal (free) key at <code>ncbi.nlm.nih.gov/account</code> and paste it in the
+<b>NCBI API Key</b> field. The key is saved automatically for future sessions.</div>
+
+<h3>Parameters</h3>
+<table>
+  <thead><tr><th>Option</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><b>Database</b></td><td><code>core_nt</code>, <code>nt</code>, <code>refseq_rna</code>, <code>16S_ribosomal_RNA</code></td></tr>
+    <tr><td><b>Program</b></td><td>blastn + MEGABLAST (recommended), blastn, or megablast</td></tr>
+    <tr><td><b>Hits per sequence</b></td><td>Number of results per sequence (1–100, default 5)</td></tr>
+    <tr><td><b>Sequences per batch</b></td><td>Sequences per batch (default 50; ≤50 recommended)</td></tr>
+    <tr><td><b>Taxonomy lookup</b></td><td>Retrieves organism + taxonomic classification (enabled by default)</td></tr>
+  </tbody>
+</table>
+
+<div class="warn"><b>⚠ NCBI usage policy</b>
+NCBI monitors and penalizes excessive use of its servers. Sending too many requests in a short time
+can lead to <b>temporary or permanent IP blocking</b> or <b>API key suspension</b>.
+Keep batches at <b>≤ 50 sequences</b> and avoid multiple or very long simultaneous sessions.</div>
+
+<h3>Output</h3>
+<p>A results table is generated in <code>.tsv</code> and <code>.xlsx</code> with the hits per sequence
+(accession, organism, taxonomy, % identity, etc.). The live log shows the progress per batch:
+info, BLAST, organism, taxonomy, progress and result.</p>
+
+<h3>How to use it</h3>
+<ol class="steps">
+  <li>Paste your NCBI API key (only the first time).</li>
+  <li>Choose database, program, number of hits and batch size.</li>
+  <li>Drag your FASTA files and press run. You can stop with <kbd>Stop</kbd>.</li>
+  <li>When finished, open the folder with the results table.</li>
+</ol>
+
+<!-- ============================================================= -->
+<h2 id="genbank">5 · GenBank Batch Search</h2>
+<p class="lead">Batch search in GenBank (nucleotide) with up to two crossed criteria.</p>
+<p>Replaces the old bash scripts <code>GB-retrieve-by-region</code> and <code>GB-retrieve-by-species</code>
+(based on NCBI EDirect, which does not run natively on Windows) with a graphical interface: define a list of
+terms for <b>Criterion 1</b> (e.g. species), optionally crossed with a <b>Criterion 2</b> (e.g.
+country/region or gene), and obtain record counts, metadata and FASTA sequences directly from the
+NCBI API (E-utilities), without depending on external utilities.</p>
+
+<h3>NCBI API key (optional)</h3>
+<p>Unlike BLAST, the key is <b>not mandatory</b> here: without it NCBI limits to ~3 requests/sec;
+with it, up to ~10/sec. It is saved in the same file used by the BLAST tab
+(<code>_profiles/blast_config.json</code>), so if you already configured it there you do not need to paste it again.</p>
+
+<h3>Criterion 1 and Criterion 2</h3>
+<ul>
+  <li><b>Field:</b> the NCBI search tag — <code>Organism</code>, <code>Country</code>, <code>Gene</code>,
+    <code>Title</code>, <code>All Fields</code>, <code>Accession</code>, <code>Author</code>, <code>Journal</code>.</li>
+  <li><b>Term list:</b> type or paste one term per line, or drag a <code>.txt</code>/<code>.csv</code> file
+    onto the field (it highlights when dragging a valid file). The <b>"N terms"</b> counter updates live.
+    The <b>✕ Clear list</b> button empties only that list.</li>
+  <li><b>Criterion 2 (optional):</b> enabled with the "Add second criterion" checkbox. With <b>a single value</b>,
+    it acts as a fixed filter applied to every term of Criterion 1 (equivalent to the <code>region=colombia</code>
+    of the old scripts). With <b>several values</b>, they are crossed with each term of Criterion 1
+    (Cartesian product: each combination is an independent query).</li>
+</ul>
+
+<h3>Options</h3>
+<table>
+  <thead><tr><th>Option</th><th>Description</th></tr></thead>
+  <tbody>
+    <tr><td><b>Records per query (cap)</b></td><td>Maximum records to download per query (1–10,000,
+      default 500). Does not limit the count shown — only how many records are downloaded for metadata/FASTA.</td></tr>
+    <tr><td><b>Record counts (CSV)</b></td><td>Always active: a record count per term/combination.</td></tr>
+    <tr><td><b>Metadata (XLSX)</b></td><td>Table with accession, organism, <b>marker/gene</b>, definition,
+      length, molecule type, division, country, isolate, specimen voucher, collection date, coordinates,
+      taxon ID, creation/update dates and taxonomy.</td></tr>
+    <tr><td><b>Sequences (FASTA)</b></td><td>Sequences with header
+      <code>accession|organism|marker|term1|term2</code>.</td></tr>
+  </tbody>
+</table>
+
+<div class="warn"><b>⚠ NCBI usage policy</b>
+A high cap combined with long term lists can generate many requests. Keep batches reasonable
+and avoid simultaneous or very prolonged sessions.</div>
+
+<h3>Customize summary report</h3>
+<p>Optional section that adds extra columns to the counts table: for each term, how many distinct values
+were found in a field and/or which they are. Available columns: <b>Marker/Gene</b>,
+<b>Moltype</b>, <b>Division</b> and <b>Country</b>.</p>
+<ul>
+  <li><b>Count:</b> number of distinct values found.</li>
+  <li><b>List values:</b> lists the values found (ordered by frequency).</li>
+  <li><b>With counts:</b> next to each value in the list, how many times it appeared — e.g. <code>Colombia (12)</code>.</li>
+  <li><b>Limit list to N values:</b> trims the list shown in the cell (the total count is still exact,
+    with a "… +N more" note).</li>
+</ul>
+<div class="note"><b>Note</b>
+Customizing the summary requires downloading each record from NCBI (subject to the cap above), even if you do
+not save metadata or FASTA — it is the only way to compute the distinct values per term, since GenBank
+is a remote API and does not offer server-side aggregations the way the local BOLD database does.</div>
+
+<h3>Molecular marker (Marker/Gene)</h3>
+<p>GenBank <b>has no dedicated field</b> for a molecular marker. It is taken from the first <i>feature</i>
+of the record (<code>gene</code>, <code>CDS</code>, <code>rRNA</code>, <code>tRNA</code>…) other than
+<code>source</code>: its <code>/gene</code> qualifier (short name, e.g. "COX1") or, if it does not exist,
+<code>/product</code> (descriptive text, e.g. "large subunit ribosomal RNA").</p>
+<div class="tip"><b>Inconsistent nomenclature</b>
+Since it is not standardized, the same gene can appear written in different ways across records
+(COI / COX1 / CO1 / cox1…). If you are going to use "Marker/Gene" for exact counts, it is advisable to
+review/normalize those values afterward.</div>
+
+<h3>Output files</h3>
+<p>When you press <kbd>Search GenBank →</kbd>, a destination folder is requested (automatic or manual).
+The following are generated:</p>
+<table>
+  <thead><tr><th>File</th><th>Content</th></tr></thead>
+  <tbody>
+    <tr><td><code>genbank_batch_counts_&lt;date&gt;.csv</code></td><td>One row per term/combination with
+      the record count (+ customized summary columns, if enabled).</td></tr>
+    <tr><td><code>genbank_batch_metadata_&lt;date&gt;.xlsx</code></td><td>Compiled metadata from all
+      terms (if "Metadata" is checked).</td></tr>
+    <tr><td><code>genbank_batch_sequences_&lt;date&gt;.fasta</code></td><td>Compiled sequences from all
+      terms (if "Sequences" is checked).</td></tr>
+    <tr><td><code>individual_results/&lt;term&gt;/</code></td><td>One subfolder per term (or per
+      term1+term2 combination) with its own <code>metadata_&lt;term&gt;.xlsx</code> and
+      <code>sequences_&lt;term&gt;.fasta</code>.</td></tr>
+  </tbody>
+</table>
+
+<h3>How to use it</h3>
+<ol class="steps">
+  <li>(Optional) Paste your NCBI API key — it speeds up the searches.</li>
+  <li>Choose the Criterion 1 field and type, paste or drag your list of terms.</li>
+  <li>(Optional) Enable Criterion 2 with a fixed value or a list to cross.</li>
+  <li>Adjust the record cap and check which outputs you want (metadata, FASTA, customized summary).</li>
+  <li>Press <kbd>Search GenBank →</kbd>. The progress bar advances per query and also within
+    large downloads of a single query. You can stop with <kbd>Stop</kbd>.</li>
+  <li>When finished, open the folder with <kbd>Open folder 📂</kbd>.</li>
+</ol>
+
+<!-- ============================================================= -->
+<h2 id="bold">6 · BOLD Formatter</h2>
+<p class="lead">Restyles the BOLD "Barcode ID" Excel workbook to the BLAST report format.</p>
+<p>Takes a <code>.xlsx</code> file exported from BOLD and reformats it to match the BLAST results
+workbook: a <b>"Hit rank"</b> column per group, top-N hits per <b>Query ID</b>, colors per group,
+alternating fills, frozen header and filters.</p>
+
+<div class="note"><b>Expected input format</b>
+BOLD "Barcode ID" workbook: one title row, one header row with columns <b>"Query ID"</b> and
+<b>"ID%"</b>, and then the hit rows grouped by Query ID.</div>
+
+<h3>Options</h3>
+<ul>
+  <li><b>Hits to keep per Query ID</b>: how many hits to keep per query (1–999, default 5).</li>
+  <li><b>Keep all hits</b>: keeps all hits and ignores the limit above.</li>
+</ul>
+<p>Output: <span class="pill out"><code>&lt;name&gt;_formatted.xlsx</code></span></p>
+
+<h3>How to use it</h3>
+<ol class="steps">
+  <li>Drag or select the <code>.xlsx</code> exported from BOLD.</li>
+  <li>Set how many hits to keep (or check "Keep all hits").</li>
+  <li>Press <kbd>Format →</kbd> and open the formatted file with <kbd>Open folder 📂</kbd>.</li>
+</ol>
+
+<!-- ============================================================= -->
+<h2 id="tips">Tips &amp; troubleshooting</h2>
+<div class="grid">
+  <div class="mini"><b>The app does not open</b><br>It should install whatever is missing (<code>PyQt5</code>,
+    <code>edlib</code>, <code>xlsxwriter</code>, <code>openpyxl</code>) on startup when run from source.
+    If it fails, install them manually and check the error message in the console.</div>
+  <div class="mini"><b>BLAST fails or hangs</b><br>Almost always a missing/incorrect API key or
+    a block from excessive NCBI use. Reduce the batch size and wait.</div>
+  <div class="mini"><b>The comparison does not pair samples</b><br>Adjust the delimiter and occurrence,
+    use "any of these", or switch to Regex mode + normalization to unify naming conventions.</div>
+  <div class="mini"><b>"Append" does not find IDs</b><br>Column 1 of the Excel file must match the
+    FASTA header (without <code>&gt;</code>). Remember the value normalization.</div>
+  <div class="mini"><b>Very large FASTQ</b><br>The analysis uses multiprocessing; the scatter plot
+    samples 10,000 points, but the statistics cover all reads.</div>
+  <div class="mini"><b>Where do the outputs go?</b><br>In FASTA Tools and BOLD, next to the input
+    files. In Compare and GenBank Batch, in the folder you choose when starting. Always use <kbd>Open folder 📂</kbd>.</div>
+  <div class="mini"><b>GenBank Batch is very slow</b><br>Without an NCBI API key the limit is ~3 requests/sec.
+    Paste a (free) key to go up to ~10/sec, and avoid very high record caps with long lists.</div>
+</div>
+
+<footer class="pg">
+  User guide for <b>BarcodeSuite</b> (<code>barcodeSuite.py</code>) · Part of the ONTbarcoder v3.1b project.
+  Document generated automatically from the source code.
+</footer>
+
+</main>
+</div>
+</body>
+</html>

@@ -26,3 +26,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Build spec (kept local, not published)
+barcodeSuite.spec

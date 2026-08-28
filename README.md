@@ -46,10 +46,13 @@ taskbar icon.
 
 ```bash
 pip install pyinstaller
-pyinstaller barcodeSuite.spec
+pyinstaller --noconsole --icon icon.ico --name BarcodeSuite barcodeSuite.py
 ```
 
-The build is written to `dist/BarcodeSuite/`.
+The build is written to `dist/BarcodeSuite/`. Note that `openpyxl` loads some
+submodules and data files dynamically, so you may need to add
+`--collect-all openpyxl --hidden-import et_xmlfile` if the frozen app fails to
+read `.xlsx` files.
 
 ## API keys
 

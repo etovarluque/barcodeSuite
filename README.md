@@ -20,6 +20,17 @@ The app opens a single window with six independent tabs:
 | **GenBank Batch** | Batch search in GenBank (nucleotide) with up to two crossed criteria; returns record counts (CSV), metadata (XLSX) and sequences (FASTA). |
 | **BOLD Formatter** | Reformats the BOLD "Barcode ID" Excel workbook to the style of the BLAST results report. |
 
+## Screenshots
+
+| | |
+| --- | --- |
+| ![FASTQ Inspector](screenshots/screenshot1_bs.png) | ![FASTA Tools](screenshots/screenshot2_bs.png) |
+| *FASTQ Inspector* | *FASTA Tools* |
+| ![FASTA Compare](screenshots/screenshot3_bs.png) | ![BLAST](screenshots/screenshot4_bs.png) |
+| *FASTA Compare* | *BLAST NCBI Search* |
+| ![GenBank Batch](screenshots/screenshot5_bs.png) | |
+| *GenBank Batch Search* | |
+
 ## Requirements
 
 - Python 3

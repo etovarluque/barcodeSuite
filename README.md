@@ -108,7 +108,7 @@ A full user guide (English) is available at
 
 ## Project
 
-Version 2.0.0. Part of the ONTbarcoder3 project (utilities synced with ONTbarcoder3 3.5.1).
+Version 2.0.1. Part of the ONTbarcoder3 project (utilities synced with ONTbarcoder3 3.6.0).
 
 ## License
 

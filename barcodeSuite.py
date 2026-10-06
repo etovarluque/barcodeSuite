@@ -94,7 +94,7 @@ from _utilities.blast_panel import BlastPanel, _BlastWorker, _BlastFileWorker
 from _utilities.genbank_batch import GenbankBatchPanel
 from _utilities.bold_formatter import BoldFormatterPanel
 
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 APP_NAME = "BarcodeSuite"
 
 # Sidebar layout: (section, [(tool key, label, icon), ...])

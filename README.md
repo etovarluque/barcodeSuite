@@ -9,7 +9,7 @@ a standalone `.exe` (PyInstaller).
 
 ## Tools
 
-The app opens a single window with seven independent tools, listed in a sidebar:
+The app opens a single window with six independent tools, listed in a sidebar:
 
 | Tool | What it does |
 | --- | --- |
@@ -17,7 +17,6 @@ The app opens a single window with seven independent tools, listed in a sidebar:
 | **FASTA Tools** | Nine operations on FASTA files: stats (with optional stop-codon check), unique / identical sequences, grep, header-field filters, append info from `.xlsx`, reformat, trim to coding ORF and multi-key sort. |
 | **FASTA Compare** | Compares multiFASTA files from different runs sample by sample and classifies each sample as identical / IUPAC-compatible / different / unique. |
 | **BLAST** | Online BLAST search against NCBI (API tab) or parsing of BLAST web result files (file tab), with taxonomy lookup, query-taxonomy reference and `Tax_level_match`. |
-| **Best Sequence** | Picks the best sequence per sample from one or more FASTA + BLAST-results pairs (can be fed directly from the BLAST tab). |
 | **GenBank Batch** | Batch search in GenBank (nucleotide) with up to two crossed criteria; returns record counts (CSV), metadata (XLSX) and sequences (FASTA). |
 | **BOLD Formatter** | Reformats the BOLD "Barcode ID" Excel workbook to the style of the BLAST results report. |
 
@@ -33,16 +32,16 @@ window geometry are remembered between sessions.
 
 | | |
 | --- | --- |
-| ![FASTQ Inspector](guide/screenshots/01-fastq-inspector-v2.png) | ![FASTA Tools](guide/screenshots/02-fasta-tools-v2.png) |
+| ![FASTQ Inspector](guide/screenshots/01-fastq-inspector.png) | ![FASTA Tools](guide/screenshots/02-fasta-tools.png) |
 | *FASTQ Inspector* | *FASTA Tools* |
-| ![FASTA Compare](guide/screenshots/03-fasta-compare-v2.png) | ![Compare results](guide/screenshots/04-compare-results-v2.png) |
+| ![FASTA Compare](guide/screenshots/03-fasta-compare.png) | ![Compare results](guide/screenshots/04-compare-results.png) |
 | *FASTA Compare* | *Compare results* |
-| ![BLAST](guide/screenshots/05-blast-v2.png) | ![Best Sequence](guide/screenshots/06-best-sequence-v2.png) |
-| *BLAST* | *Best Sequence* |
-| ![GenBank Batch](guide/screenshots/07-genbank-batch-v2.png) | ![BOLD Formatter](guide/screenshots/08-bold-formatter-v2.png) |
-| *GenBank Batch* | *BOLD Formatter* |
-| ![Dark theme](guide/screenshots/09-dark-theme-v2.png) | ![Collapsed sidebar](guide/screenshots/10-collapsed-sidebar-v2.png) |
-| *Dark theme* | *Collapsed sidebar* |
+| ![BLAST](guide/screenshots/05-blast.png) | ![GenBank Batch](guide/screenshots/06-genbank-batch.png) |
+| *BLAST* | *GenBank Batch* |
+| ![BOLD Formatter](guide/screenshots/07-bold-formatter.png) | ![Dark theme](guide/screenshots/08-dark-theme.png) |
+| *BOLD Formatter* | *Dark theme* |
+| ![Collapsed sidebar](guide/screenshots/09-collapsed-sidebar.png) | |
+| *Collapsed sidebar* | |
 
 ## Requirements
 

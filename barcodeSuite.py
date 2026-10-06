@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 # barcodeSuite.py - BarcodeSuite: FASTQ Inspector, FASTA Tools, FASTA Compare, BLAST,
-# Best Sequence, GenBank Batch, BOLD Formatter
+# GenBank Batch, BOLD Formatter
 
 from __future__ import annotations
 
@@ -91,7 +91,6 @@ from _utilities.fasta_tools import FastaToolsPanel
 from _utilities.compare_panel import ComparePanel, _CompareWorker, _PairCompareWorker
 from _utilities import compare_panel as _compare_panel
 from _utilities.blast_panel import BlastPanel, _BlastWorker, _BlastFileWorker
-from _utilities.best_seq_panel import BestSeqPanel, _BestSeqWorker
 from _utilities.genbank_batch import GenbankBatchPanel
 from _utilities.bold_formatter import BoldFormatterPanel
 
@@ -103,8 +102,7 @@ _TOOL_SECTIONS = [
     ("Reads",          [("fastq", "FASTQ Inspector", "fastq")]),
     ("Sequences",      [("fasta", "FASTA Tools", "fasta"),
                         ("compare", "FASTA Compare", "compare")]),
-    ("Identification", [("blast", "BLAST", "blast"),
-                        ("best_seq", "Best Sequence", "best")]),
+    ("Identification", [("blast", "BLAST", "blast")]),
     ("Databases",      [("genbank", "GenBank Batch", "genbank"),
                         ("bold", "BOLD Formatter", "bold")]),
 ]
@@ -115,7 +113,7 @@ def _settings() -> QtCore.QSettings:
 
 
 class MainWindow(QtWidgets.QMainWindow):
-    """Sidebar host for the utility panels. Compare, BLAST and Best Sequence
+    """Sidebar host for the utility panels. Compare and BLAST
     only emit requests; the workers are started and wired here (same glue as
     ONTbarcoder3's MainWindow)."""
 
@@ -128,7 +126,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_fasta_tools     = FastaToolsPanel()
         self._panel_compare         = ComparePanel()
         self._panel_blast           = BlastPanel()
-        self._panel_best_seq        = BestSeqPanel()
         self._panel_genbank         = GenbankBatchPanel()
         self._panel_bold_formatter  = BoldFormatterPanel()
 
@@ -137,7 +134,6 @@ class MainWindow(QtWidgets.QMainWindow):
             "fasta":    self._panel_fasta_tools,
             "compare":  self._panel_compare,
             "blast":    self._panel_blast,
-            "best_seq": self._panel_best_seq,
             "genbank":  self._panel_genbank,
             "bold":     self._panel_bold_formatter,
         }
@@ -175,8 +171,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._panel_compare.compareRequested.connect(self._start_comparison)
         self._panel_blast.blastRequested.connect(self._start_blast)
         self._panel_blast.blastFileRequested.connect(self._start_blast_file)
-        self._panel_blast.sendToBestSeq.connect(self._open_in_best_seq)
-        self._panel_best_seq.bestSeqRequested.connect(self._start_best_seq)
+        # Best Sequence is not part of the Suite (it is tied to ONTbarcoder's
+        # multi-run workflow): drop BLAST's hand-off button. blast_panel.py is
+        # shared verbatim, so the button is neutralised here instead.
+        btn = self._panel_blast._send_best_btn
+        btn.hide()
+        btn.show = lambda: None
 
     # ── Navigation / appearance ──────────────────────────────────────────────
 
@@ -410,42 +410,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.blast_file_worker.taskError.connect(pnl.on_file_error)
         self.blast_file_worker.start()
 
-    def _open_in_best_seq(self, paths: list):
-        """BLAST → Best Sequence: load the queried FASTA and its results table
-        as a pair and show the panel."""
-        self._panel_best_seq._drop._add_files(paths)
-        self._switch_tool("best_seq")
-
-    # ── Best Sequence ────────────────────────────────────────────────────────
-
-    def _start_best_seq(self, pairs: list, cfg: dict):
-        pnl = self._panel_best_seq
-        outdir = self._ask_outdir("bestseq")
-        if not outdir:
-            return
-        try:
-            os.makedirs(outdir, exist_ok=True)
-        except Exception as e:
-            pnl.on_error(f"Could not create output folder: {e}")
-            return
-        cfg["outdir"] = outdir
-        pnl.set_running(True)
-        pnl.update_status("result", f"Output      │ {outdir}")
-
-        try:
-            pnl.stopRequested.disconnect()
-        except (RuntimeError, TypeError):
-            pass
-        self._drop_worker("best_seq_worker")
-
-        self.best_seq_worker = _BestSeqWorker(pairs, cfg)
-        pnl.stopRequested.connect(self.best_seq_worker.stop)
-        self.best_seq_worker.statusUpdated.connect(pnl.update_status)
-        self.best_seq_worker.progressUpdated.connect(pnl.set_progress)
-        self.best_seq_worker.taskFinished.connect(pnl.on_finished)
-        self.best_seq_worker.taskError.connect(pnl.on_error)
-        self.best_seq_worker.start()
-
     # ── Shutdown ─────────────────────────────────────────────────────────────
 
     def closeEvent(self, event):
@@ -453,7 +417,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # QThread destroyed while running aborts the process, so one still
         # alive after the wait is handed to C++ ownership and never deleted.
         workers = [getattr(self, a, None) for a in
-                   ("blast_worker", "blast_file_worker", "comp_worker", "best_seq_worker")]
+                   ("blast_worker", "blast_file_worker", "comp_worker")]
         workers += self.__dict__.get("_retired_blast_workers", [])
         for pnl in (self._panel_fasta_tools, self._panel_fastq_inspector,
                     self._panel_bold_formatter, self._panel_genbank):

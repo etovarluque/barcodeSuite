@@ -122,10 +122,9 @@
     <a href="#compare" class="sub">3 · FASTA Compare</a>
     <div class="grp">Identification</div>
     <a href="#blast" class="sub">4 · BLAST</a>
-    <a href="#best" class="sub">5 · Best Sequence</a>
     <div class="grp">Databases</div>
-    <a href="#genbank" class="sub">6 · GenBank Batch</a>
-    <a href="#bold" class="sub">7 · BOLD Formatter</a>
+    <a href="#genbank" class="sub">5 · GenBank Batch</a>
+    <a href="#bold" class="sub">6 · BOLD Formatter</a>
     <div class="grp">Extra</div>
     <a href="#tips">Tips &amp; troubleshooting</a>
   </nav>
@@ -134,7 +133,7 @@
 <main>
 
 <h1 id="intro">BarcodeSuite User Guide</h1>
-<p class="lead">BarcodeSuite is a desktop app with seven tools for working with <b>FASTQ</b> and
+<p class="lead">BarcodeSuite is a desktop app with six tools for working with <b>FASTQ</b> and
 <b>FASTA</b> files in <i>DNA barcoding</i> workflows. It reads outputs from ONTbarcoder / Nanopore,
 BOLD and GenBank.</p>
 <p>
@@ -151,7 +150,6 @@ BOLD and GenBank.</p>
     <div class="mini"><b>FASTA Tools</b><br>Nine operations on FASTA files, including stats, filters, appending info to headers, ORF trimming and sorting.</div>
     <div class="mini"><b>FASTA Compare</b><br>Compares barcodes sample by sample across runs or against a reference.</div>
     <div class="mini"><b>BLAST</b><br>Runs an NCBI BLAST search, or reads results downloaded from the BLAST website.</div>
-    <div class="mini"><b>Best Sequence</b><br>Keeps the best sequence per sample across runs, using each candidate's BLAST hits.</div>
     <div class="mini"><b>GenBank Batch</b><br>Batch GenBank search with up to two crossed criteria. Writes counts, metadata and FASTA.</div>
     <div class="mini"><b>BOLD Formatter</b><br>Restyles a BOLD "Barcode ID" workbook to match the BLAST results report.</div>
   </div>
@@ -186,7 +184,7 @@ window and taskbar icon.</div>
 <h2 id="interface">The interface</h2>
 
 <figure>
-  <img src="screenshots/01-fastq-inspector-v2.png" alt="BarcodeSuite main window with the FASTQ Inspector open">
+  <img src="screenshots/01-fastq-inspector.png" alt="BarcodeSuite main window with the FASTQ Inspector open">
   <figcaption><b>Figure 1.</b> The main window: the tool sidebar on the left, the active tool on the right.</figcaption>
 </figure>
 
@@ -204,11 +202,11 @@ window and taskbar icon.</div>
 
 <div class="duo">
   <figure>
-    <img src="screenshots/09-dark-theme-v2.png" alt="Dark theme">
+    <img src="screenshots/08-dark-theme.png" alt="Dark theme">
     <figcaption><b>Figure 2.</b> Dark theme.</figcaption>
   </figure>
   <figure>
-    <img src="screenshots/10-collapsed-sidebar-v2.png" alt="Collapsed sidebar">
+    <img src="screenshots/09-collapsed-sidebar.png" alt="Collapsed sidebar">
     <figcaption><b>Figure 3.</b> Collapsed sidebar (icons only, names shown on hover).</figcaption>
   </figure>
 </div>
@@ -228,7 +226,7 @@ window and taskbar icon.</div>
 <div class="note"><b>Where results are saved</b>
 When a run starts, the app asks where to save the results. The default is an automatic folder
 <code>output/ont-barcoder_&lt;date&gt;_&lt;tool&gt;/</code> next to the program
-(e.g. <code>…_comp</code>, <code>…_blast</code>, <code>…_bestseq</code>). You can pick a different
+(e.g. <code>…_comp</code>, <code>…_blast</code>, <code>…_fastools</code>). You can pick a different
 folder instead. GenBank Batch writes to <code>genbank_batch_&lt;date&gt;/</code>.</div>
 
 <div class="note"><b>Accepted formats</b>
@@ -286,7 +284,7 @@ turns amber and names the affected file(s).</p>
 <p class="lead">Batch operations on one or more FASTA files.</p>
 
 <figure>
-  <img src="screenshots/02-fasta-tools-v2.png" alt="FASTA Tools">
+  <img src="screenshots/02-fasta-tools.png" alt="FASTA Tools">
   <figcaption><b>Figure 4.</b> FASTA Tools with two files loaded and the <i>FASTA stats</i> operation selected.</figcaption>
 </figure>
 
@@ -368,7 +366,7 @@ and how many sequences match the spreadsheet or the pattern list.</p>
 reference. Each sample's sequences are aligned (edlib, global alignment) and classified as follows:</p>
 
 <figure>
-  <img src="screenshots/03-fasta-compare-v2.png" alt="FASTA Compare">
+  <img src="screenshots/03-fasta-compare.png" alt="FASTA Compare">
   <figcaption><b>Figure 5.</b> FASTA Compare with two runs loaded. The ID preview is taken from a real header of the loaded files.</figcaption>
 </figure>
 
@@ -409,7 +407,7 @@ from a real header.</p>
 
 <h3>Results</h3>
 <figure>
-  <img src="screenshots/04-compare-results-v2.png" alt="Comparison results window">
+  <img src="screenshots/04-compare-results.png" alt="Comparison results window">
   <figcaption><b>Figure 6.</b> The results window (<kbd>Show table ↗</kbd>): totals per state, the letter alias of each run, and one row per sample.</figcaption>
 </figure>
 <p>Each file gets a one-letter <b>alias</b> (<code>A</code>, <code>B</code>, <code>C</code>…, in the
@@ -451,7 +449,7 @@ one can run at a time: each has its own NCBI rate limiter, and running both woul
 rate.</p>
 
 <figure>
-  <img src="screenshots/05-blast-v2.png" alt="BLAST API Search">
+  <img src="screenshots/05-blast.png" alt="BLAST API Search">
   <figcaption><b>Figure 7.</b> BLAST API Search with a FASTA file loaded.</figcaption>
 </figure>
 
@@ -476,8 +474,7 @@ and by GenBank Batch. The key is hidden on screen; <kbd>Show</kbd> / <kbd>Hide</
 </table>
 <ul>
   <li>Hits are written as the run progresses to <code>blast-&lt;ts&gt;.tsv</code> and <code>.xlsx</code>. The
-    queried sequences are saved as <code>blast-&lt;ts&gt;.fa</code>, which has the same base name, so the pair is
-    ready for <a href="#best">Best Sequence</a>.</li>
+    queried sequences are saved alongside as <code>blast-&lt;ts&gt;.fa</code>, with the same base name.</li>
   <li>Sequences with no hit go to <code>nohit_seqs_&lt;ts&gt;.fa</code>. Batches that failed, or whose results could
     not be downloaded, go to <code>missing_seqs_&lt;ts&gt;.fa</code>; the log gives the RID so you can retrieve them by
     hand. The counts are recorded in <code>blast_run_log_&lt;ts&gt;.txt</code>.</li>
@@ -485,8 +482,6 @@ and by GenBank Batch. The key is hidden on screen; <kbd>Show</kbd> / <kbd>Hide</
   <li>Each search can wait up to 45 minutes; its status is checked once a minute. <kbd>Stop</kbd> takes effect
     within about 30 s.</li>
   <li>Taxonomy and accession lookups are cached (<code>taxadb.dbx</code>, <code>accdb.dbx</code>) and reused in later runs.</li>
-  <li>When the search finishes, <kbd>Open in Best Sequence →</kbd> loads the FASTA and its table into
-    <a href="#best">Best Sequence</a> and switches to that tool.</li>
 </ul>
 <div class="warn"><b>NCBI usage policy</b>
 NCBI limits each IP to <b>100 searches per 24&nbsp;h</b>; beyond that, your traffic moves to a slower queue or is
@@ -502,8 +497,8 @@ files at once.</p>
   <li><b>Hits per sequence to keep</b> caps how many hits are kept per query.</li>
   <li><b>Fetch organism + taxonomic classification</b> uses NCBI E-utilities. These requests do not count toward the
     100-searches limit.</li>
-  <li>The tab writes <code>blastfile-&lt;ts&gt;.tsv</code> / <code>.xlsx</code> and a run log. It writes <b>no FASTA</b>,
-    so in Best Sequence drop the table together with the FASTA you searched.</li>
+  <li>The tab writes <code>blastfile-&lt;ts&gt;.tsv</code> / <code>.xlsx</code> and a run log. It writes <b>no FASTA</b>
+    of the queried sequences, because the downloaded file contains hits only.</li>
 </ul>
 
 <h3>4.3 Query taxonomy reference file (both tabs)</h3>
@@ -524,101 +519,15 @@ DNS-1400,Poales,Poaceae,Chusquea,Chusquea scandens</pre>
 updates the <code>.tsv</code>/<code>.csv</code> in place and rebuilds its <code>.xlsx</code>.</p>
 
 <!-- ============================================================= -->
-<h2 id="best">5 · Best Sequence</h2>
-<p class="lead">Keeps one best sequence per sample across several runs, using BLAST hits to decide.</p>
-<p>When the same library is processed several times with different parameters, each run recovers slightly different
-consensus sequences. This tool merges the runs and keeps the best sequence for each sample.</p>
-
-<figure>
-  <img src="screenshots/06-best-sequence-v2.png" alt="Best Sequence">
-  <figcaption><b>Figure 8.</b> Best Sequence with two runs, each a FASTA paired with its BLAST table.</figcaption>
-</figure>
-
-<table>
-  <thead><tr><th>Input</th><th>Mode</th><th>What it does</th></tr></thead>
-  <tbody>
-  <tr><td><b>Two or more</b> FASTA + table pairs</td><td>Selection</td><td>Compares the runs and keeps the best sequence for each sample.</td></tr>
-  <tr><td><b>One</b> pair</td><td>Classification</td><td>Keeps every sequence and splits the run by taxonomic match
-      (<code>Decision = single_run</code>). A quick way to triage a single BLAST run.</td></tr>
-  </tbody>
-</table>
-
-<h3>5.1 Input</h3>
-<p>Drop each FASTA together with its BLAST table. Files are paired <b>by base name</b>
-(<code>run_strict.fa</code> + <code>run_strict.xlsx</code>). The BLAST tool already writes its output this way. If
-exactly one FASTA and one table are left without a name match, they are paired anyway. Tables can be
-<code>.xlsx</code>, <code>.tsv</code> or <code>.csv</code>.</p>
-<div class="warn"><b>Required columns</b>
-Every hit row must include the expected taxonomy of the sample: <code>Query_Order</code>, <code>Query_Family</code>,
-<code>Query_Genus</code> and <code>Query_organism</code>. It also needs the usual BLAST columns (<code>Query_name</code>,
-<code>Hit_rank</code>, <code>Alignment_length</code>, <code>Bit_score</code>, <code>P_identity</code>,
-<code>Subject_accession.ver</code>, and <code>Subject_Order/Family/Genus/organism</code>, which come from <i>Taxonomy lookup</i>).
-Instead of adding the <code>Query_*</code> columns by hand, tick <b>I have a reference file with the query taxonomy</b>:
-they are then written into every table before the run, as in <a href="#blast">§4.3</a>. Close the tables in Excel first.</div>
-
-<h3>5.2 How the best sequence is chosen</h3>
-<ol>
-  <li>If a sample's sequence is identical in every run, it is kept as is (<code>identical_in_all_runs</code> /
-    <code>identical_in_available_runs</code>).</li>
-  <li>Otherwise each candidate is scored using the hit that matches the expected taxonomy at the deepest rank:
-<pre>score = taxonomic bonus  (species 400 · genus 300 · family 200 · order 100 · none 0)
-      + 100 × (its bit score ÷ best bit score of the sample)
-      − 2 × ambiguities − 2 × estimated gaps</pre>
-    Ties go to the longer sequence, then to more reads, then to the file name.</li>
-</ol>
-<p>Because the rank bonuses are 100 points apart, <b>taxonomic agreement always outranks raw alignment score</b>.
-A species-level match requires a real species name on both sides. Open nomenclature (<code>sp.</code>, <code>cf.</code>
-differing) falls back to a genus-level comparison.</p>
-
-<h3>5.3 Settings</h3>
-<table>
-  <thead><tr><th>Setting</th><th>Default</th><th>Description</th></tr></thead>
-  <tbody>
-  <tr><td>Minimum alignment length (bp)</td><td>100</td><td>Shorter hits are discarded as spurious before scoring.</td></tr>
-  <tr><td>Strip suffix from sample ID</td><td><code>_all.fa</code></td><td>Removed from the sample ID read from the header.</td></tr>
-  </tbody>
-</table>
-
-<h3>5.4 Outputs</h3>
-<table>
-  <thead><tr><th>File</th><th>Content</th></tr></thead>
-  <tbody>
-  <tr><td><code>bestseq-&lt;ts&gt;_all.fasta</code></td><td>The best sequence of every sample.</td></tr>
-  <tr><td><code>bestseq-&lt;ts&gt;_identified.fasta</code></td><td>Sequences whose best hit matches the expected taxonomy at some rank.</td></tr>
-  <tr><td><code>bestseq-&lt;ts&gt;_no_tax_hit.fasta</code></td><td>Sequences that match no rank. Review these.</td></tr>
-  <tr><td><code>bestseq-&lt;ts&gt;.tsv</code> / <code>.xlsx</code></td><td>The decision report, one row per sample.</td></tr>
-  <tr><td><code>bestseq_run_log_&lt;ts&gt;.txt</code></td><td>Inputs, parameters, scoring formula and counts.</td></tr>
-  </tbody>
-</table>
-<p>The FASTA files keep the original headers exactly and put each sequence on a single line.</p>
-
-<h4>Flags in the report</h4>
-<table>
-  <thead><tr><th>Flag</th><th>Meaning</th></tr></thead>
-  <tbody>
-  <tr><td><code>tax_mismatch</code></td><td>Hits passed the filter, but none matches the expected taxonomy at any rank.
-      <b>Review these first.</b> This can mean contamination, a mislabelled voucher, or a group the database lacks.</td></tr>
-  <tr><td><code>low_taxonomic_support</code></td><td>The best hit matches only at order level.</td></tr>
-  <tr><td><code>hits_below_min_aln</code></td><td>The table has hits, but all are shorter than the minimum alignment length.</td></tr>
-  <tr><td><code>no_blast_hit</code></td><td>No hit at all, so the choice was based on length, ambiguities and reads alone.</td></tr>
-  <tr><td><code>near_tie</code></td><td>The runner-up scored within 1 point of the winner.</td></tr>
-  <tr><td><code>secondary_variant_selected</code></td><td>A secondary variant (<code>{sample}_var{i}</code>) beat the main barcode.</td></tr>
-  <tr><td><code>missing_in_N_run(s)</code></td><td>The sample was not recovered in N runs.</td></tr>
-  </tbody>
-</table>
-<div class="tip">In the <code>.xlsx</code>, filter <b>Decision</b> = <code>resolved_by_score</code> to review only the samples
-where the runs disagreed. Those rows are shown in bold.</div>
-
-<!-- ============================================================= -->
-<h2 id="genbank">6 · GenBank Batch</h2>
+<h2 id="genbank">5 · GenBank Batch</h2>
 <p class="lead">Batch search in GenBank (nucleotide) with up to two crossed criteria.</p>
 <p>Give a list of terms for <b>Criterion 1</b> (e.g. species), optionally crossed with a <b>Criterion 2</b>
 (e.g. a country or gene). The tool returns record counts, metadata and FASTA sequences straight from the NCBI
 API (E-utilities), with no external utilities needed.</p>
 
 <figure>
-  <img src="screenshots/07-genbank-batch-v2.png" alt="GenBank Batch">
-  <figcaption><b>Figure 9.</b> GenBank Batch with a list of species for Criterion 1.</figcaption>
+  <img src="screenshots/06-genbank-batch.png" alt="GenBank Batch">
+  <figcaption><b>Figure 8.</b> GenBank Batch with a list of species for Criterion 1.</figcaption>
 </figure>
 
 <h3>NCBI API key (optional)</h3>
@@ -668,12 +577,12 @@ GenBank has no dedicated marker field. The marker is taken from the record's fir
 </table>
 
 <!-- ============================================================= -->
-<h2 id="bold">7 · BOLD Formatter</h2>
+<h2 id="bold">6 · BOLD Formatter</h2>
 <p class="lead">Restyles a BOLD "Barcode ID" export to look like the BLAST results workbook.</p>
 
 <figure>
-  <img src="screenshots/08-bold-formatter-v2.png" alt="BOLD Formatter">
-  <figcaption><b>Figure 10.</b> BOLD Formatter with a BOLD export loaded.</figcaption>
+  <img src="screenshots/07-bold-formatter.png" alt="BOLD Formatter">
+  <figcaption><b>Figure 9.</b> BOLD Formatter with a BOLD export loaded.</figcaption>
 </figure>
 
 <h3>Input</h3>
@@ -706,8 +615,6 @@ taxonomy.</p>
     rejected large batch. Use Automatic batch size, wait, or use <i>BLAST web results</i>.</div>
   <div class="mini"><b>Compare does not pair samples</b><br>Check the ID preview. Adjust the delimiter and occurrence,
     use <i>any of these</i>, or switch to Regex mode with normalization.</div>
-  <div class="mini"><b>Best Sequence rejects a table</b><br>It lacks the <code>Query_*</code> or <code>Subject_*</code>
-    columns. Use the reference file option, and run BLAST with <i>Taxonomy lookup</i>.</div>
   <div class="mini"><b>"Append" does not find IDs</b><br>Check the ID rule and its preview. Column 1 of the Excel file
     must match the ID after normalization.</div>
   <div class="mini"><b>A file cannot be written</b><br>It is probably open in Excel. Close it and run again.</div>

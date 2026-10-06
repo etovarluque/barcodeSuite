@@ -51,6 +51,9 @@ _EXACT = {
         "#1A1A18": "#1B2420", "#6B6960": "#5C6B65", "#A09D96": "#8A9A93",
         "#E0DED8": "#DDE3E0", "#EDEDED": "#EEF2F0",
         ("#F5F5F3", _BG): "#FFFFFF",
+        # Success green: soft emerald (same as ONTbarcoder3)
+        "#3B6D11": "#0E7A55", "#EAF3DE": "#EAF7F1",
+        ("#639922", _BORDER): "#9AD3BC", ("#639922", _BG): "#10875F",
     },
     "dark": {
         ("#185FA5", _BG): "#0F7A70", ("#185FA5", _BORDER): "#2A9D8F",
@@ -65,9 +68,10 @@ _EXACT = {
         ("#F5F5F3", _BG): "#182028", ("#FFFFFF", _BG): "#182028",
         ("#EDEDED", _BG): "#1D2731",
         # Status colours: readable tints on the dark ground.
-        ("#3B6D11", _FG): "#9BD67A", ("#A32D2D", _FG): "#F08A8A",
+        ("#3B6D11", _FG): "#5FD3A6", ("#A32D2D", _FG): "#F08A8A",
+        ("#639922", _BORDER): "#2F6B58", ("#639922", _BG): "#10875F",
         ("#854F0B", _FG): "#F2B36B",
-        ("#EAF3DE", _BG): "#1E3320", ("#FCEBEB", _BG): "#3A1E1E",
+        ("#EAF3DE", _BG): "#18302B", ("#FCEBEB", _BG): "#3A1E1E",
         ("#FAEEDA", _BG): "#3A2C17",
     },
 }

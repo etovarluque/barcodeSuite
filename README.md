@@ -33,15 +33,15 @@ window geometry are remembered between sessions.
 
 | | |
 | --- | --- |
-| ![FASTQ Inspector](screenshots/01-fastq-inspector-v2.png) | ![FASTA Tools](screenshots/02-fasta-tools-v2.png) |
+| ![FASTQ Inspector](guide/screenshots/01-fastq-inspector-v2.png) | ![FASTA Tools](guide/screenshots/02-fasta-tools-v2.png) |
 | *FASTQ Inspector* | *FASTA Tools* |
-| ![FASTA Compare](screenshots/03-fasta-compare-v2.png) | ![Compare results](screenshots/04-compare-results-v2.png) |
+| ![FASTA Compare](guide/screenshots/03-fasta-compare-v2.png) | ![Compare results](guide/screenshots/04-compare-results-v2.png) |
 | *FASTA Compare* | *Compare results* |
-| ![BLAST](screenshots/05-blast-v2.png) | ![Best Sequence](screenshots/06-best-sequence-v2.png) |
+| ![BLAST](guide/screenshots/05-blast-v2.png) | ![Best Sequence](guide/screenshots/06-best-sequence-v2.png) |
 | *BLAST* | *Best Sequence* |
-| ![GenBank Batch](screenshots/07-genbank-batch-v2.png) | ![BOLD Formatter](screenshots/08-bold-formatter-v2.png) |
+| ![GenBank Batch](guide/screenshots/07-genbank-batch-v2.png) | ![BOLD Formatter](guide/screenshots/08-bold-formatter-v2.png) |
 | *GenBank Batch* | *BOLD Formatter* |
-| ![Dark theme](screenshots/09-dark-theme-v2.png) | ![Collapsed sidebar](screenshots/10-collapsed-sidebar-v2.png) |
+| ![Dark theme](guide/screenshots/09-dark-theme-v2.png) | ![Collapsed sidebar](guide/screenshots/10-collapsed-sidebar-v2.png) |
 | *Dark theme* | *Collapsed sidebar* |
 
 ## Requirements

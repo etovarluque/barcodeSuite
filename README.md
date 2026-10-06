@@ -9,35 +9,48 @@ a standalone `.exe` (PyInstaller).
 
 ## Tools
 
-The app opens a single window with six independent tabs:
+The app opens a single window with seven independent tools, listed in a sidebar:
 
-| Tab | What it does |
+| Tool | What it does |
 | --- | --- |
-| **FASTQ Inspector** | Full descriptive report of a FASTQ file: read counts, length stats (min/max/mean/median/N50), Phred quality, GC content and four distribution plots. |
-| **FASTA Tools** | Seven operations on one or more FASTA files: extract unique / identical sequences, grep by header, filter by header fields, append info from `.xlsx`, reformat (wrap/unwrap) and multi-key sort. |
+| **FASTQ Inspector** | Quality report of one or more FASTQ files or a whole `fastq_pass/` folder: read counts, length stats (N50), Phred quality, GC content, per-group breakdown, plots and PDF export. |
+| **FASTA Tools** | Nine operations on FASTA files: stats (with optional stop-codon check), unique / identical sequences, grep, header-field filters, append info from `.xlsx`, reformat, trim to coding ORF and multi-key sort. |
 | **FASTA Compare** | Compares multiFASTA files from different runs sample by sample and classifies each sample as identical / IUPAC-compatible / different / unique. |
-| **BLAST** | Online BLAST search of your sequences against NCBI databases, with optional taxonomy lookup. |
+| **BLAST** | Online BLAST search against NCBI (API tab) or parsing of BLAST web result files (file tab), with taxonomy lookup, query-taxonomy reference and `Tax_level_match`. |
+| **Best Sequence** | Picks the best sequence per sample from one or more FASTA + BLAST-results pairs (can be fed directly from the BLAST tab). |
 | **GenBank Batch** | Batch search in GenBank (nucleotide) with up to two crossed criteria; returns record counts (CSV), metadata (XLSX) and sequences (FASTA). |
 | **BOLD Formatter** | Reformats the BOLD "Barcode ID" Excel workbook to the style of the BLAST results report. |
+
+## Interface
+
+Tools are grouped in a left sidebar (Reads, Sequences, Identification,
+Databases). The sidebar can be collapsed to an icon rail (tool names show as
+tooltips) with the button at its bottom or **Ctrl+B**, and the light / dark theme
+is switched from the same place. Theme, sidebar state, the last open tool and the
+window geometry are remembered between sessions.
 
 ## Screenshots
 
 | | |
 | --- | --- |
-| ![FASTQ Inspector](screenshots/01-fastq-inspector.png) | ![FASTA Tools](screenshots/02-fasta-tools.png) |
+| ![FASTQ Inspector](screenshots/01-fastq-inspector-v2.png) | ![FASTA Tools](screenshots/02-fasta-tools-v2.png) |
 | *FASTQ Inspector* | *FASTA Tools* |
-| ![FASTA Compare](screenshots/03-fasta-compare.png) | ![BLAST](screenshots/04-blast.png) |
-| *FASTA Compare* | *BLAST NCBI Search* |
-| ![GenBank Batch](screenshots/05-genbank-batch.png) | |
-| *GenBank Batch Search* | |
+| ![FASTA Compare](screenshots/03-fasta-compare-v2.png) | ![Compare results](screenshots/04-compare-results-v2.png) |
+| *FASTA Compare* | *Compare results* |
+| ![BLAST](screenshots/05-blast-v2.png) | ![Best Sequence](screenshots/06-best-sequence-v2.png) |
+| *BLAST* | *Best Sequence* |
+| ![GenBank Batch](screenshots/07-genbank-batch-v2.png) | ![BOLD Formatter](screenshots/08-bold-formatter-v2.png) |
+| *GenBank Batch* | *BOLD Formatter* |
+| ![Dark theme](screenshots/09-dark-theme-v2.png) | ![Collapsed sidebar](screenshots/10-collapsed-sidebar-v2.png) |
+| *Dark theme* | *Collapsed sidebar* |
 
 ## Requirements
 
 - Python 3
-- `PyQt5`, `edlib`, `xlsxwriter`, `openpyxl`
+- `PyQt5`, `edlib`, `xlsxwriter`, `openpyxl`, `biopython`
 
 ```bash
-pip install PyQt5 edlib xlsxwriter openpyxl
+pip install PyQt5 edlib xlsxwriter openpyxl biopython
 ```
 
 When run from source, the app checks these dependencies (and `pip` itself) at
@@ -65,6 +78,18 @@ submodules and data files dynamically, so you may need to add
 `--collect-all openpyxl --hidden-import et_xmlfile` if the frozen app fails to
 read `.xlsx` files.
 
+## Project layout
+
+```
+barcodeSuite.py      entry point: main window and worker wiring
+suite_ui.py          sidebar, icons and light/dark theming
+_utilities/          utility panels, shared verbatim with ONTbarcoder3
+  genbank_batch.py   GenBank Batch (BarcodeSuite only)
+```
+
+Every module in `_utilities/` except `genbank_batch.py` is a copy of the one in
+ONTbarcoder3; to sync, copy the newer files over.
+
 ## API keys
 
 - **BLAST** requires a free NCBI API key (register at
@@ -84,7 +109,7 @@ A full user guide (English) is available at
 
 ## Project
 
-Part of the ONTbarcoder v3.1b project.
+Version 2.0.0. Part of the ONTbarcoder3 project (utilities synced with ONTbarcoder3 3.5.1).
 
 ## License
 

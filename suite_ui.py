@@ -500,7 +500,20 @@ def restyle_compare_results(dlg: QtWidgets.QWidget):
             w.setText(w.text().replace("color:white;", "")
                       .replace("color:#9AAFCC;", "font-weight:400;"))
             w.setStyleSheet("color: #1A1A18; background: transparent;")
+    _fit_state_column(dlg)
     set_dark_titlebar(dlg, current_theme() == "dark")
+
+
+def _fit_state_column(dlg: QtWidgets.QWidget):
+    """The results table sizes its columns from the cell text, but the State
+    column holds pill widgets with extra padding, so a long state such as
+    "Unique in A" came out clipped. Widen the column to the widest pill."""
+    for table in dlg.findChildren(QtWidgets.QTableWidget):
+        for col in range(table.columnCount()):
+            widths = [table.cellWidget(r, col).sizeHint().width() + 8
+                      for r in range(table.rowCount()) if table.cellWidget(r, col)]
+            if widths and max(widths) > table.columnWidth(col):
+                table.setColumnWidth(col, max(widths))
 
 
 def install_compare_results_hook(cls):

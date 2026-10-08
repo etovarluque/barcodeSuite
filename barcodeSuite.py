@@ -178,6 +178,9 @@ class MainWindow(QtWidgets.QMainWindow):
         btn = self._panel_blast._send_best_btn
         btn.hide()
         btn.show = lambda: None
+        desc = self._panel_blast._lbl_desc
+        desc.setText(desc.text().replace(
+            ", ready to use as a pair in Best Sequence.", "."))
 
     # ── Navigation / appearance ──────────────────────────────────────────────
 

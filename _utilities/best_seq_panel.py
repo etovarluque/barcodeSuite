@@ -36,7 +36,10 @@ def read_tax_reference(path: str):
     The identifier column is the first one carrying a known ID header (Sample,
     ID, Query_name, ...), else the first column of the file. The FOUR columns
     that follow it are taken, in that order, as Order, Family, Genus and
-    Organism, whatever their own headers say.
+    Organism, whatever their own headers say — or whether there are headers
+    at all: unless the first row names a known ID header, it is also read as
+    an entry, so a file without a header row keeps its first sample (a real
+    header row becomes a harmless entry no sample is ever called).
 
     Returns (id_column_name, [4 taxonomy column names],
              {identifier: (order, family, genus, organism)}).
@@ -45,10 +48,14 @@ def read_tax_reference(path: str):
     if not headers:
         raise ValueError(f"Empty or unreadable reference file: {os.path.basename(path)}")
     id_i = 0
+    named_id = False
     for i, name in enumerate(headers):
         if str(name).strip().lower() in _REF_ID_HEADERS:
             id_i = i
+            named_id = True
             break
+    if not named_id:
+        rows = [list(headers)] + list(rows)
     if len(headers) < id_i + 5:
         raise ValueError(
             f"{os.path.basename(path)}: the identifier column "
@@ -73,7 +80,11 @@ def read_tax_reference(path: str):
             f"{os.path.basename(path)}: no identifier found in column "
             f"'{headers[id_i]}'."
         )
-    return str(headers[id_i]).strip(), tax_cols, table
+    # Without a recognised ID header the first row may be data: name the
+    # column by position rather than by what may be a sample code.
+    id_name = (str(headers[id_i]).strip() if named_id
+               else f"column {id_i + 1} (first row: '{str(headers[id_i]).strip()}')")
+    return id_name, tax_cols, table
 
 
 # ── Writing the reference taxonomy into a BLAST table ───────────────────────
@@ -100,6 +111,205 @@ def sample_id_of(query_name, strip_suffix: str = "") -> str:
     return sample
 
 
+_ALL_FA = "_all.fa"
+
+
+def sample_of_header(header, strip_suffix: str = "") -> str:
+    """Sample a FASTA record is grouped under in Best Sequence: its sample ID
+    (see sample_id_of) without a trailing '_all.fa', so a consensus
+    ('{sample}_all.fa') and its variants ('{sample}_var{i}') share one sample
+    even when the suffix field was cleared."""
+    sample = sample_id_of(header, strip_suffix)
+    if sample.endswith(_ALL_FA) and len(sample) > len(_ALL_FA):
+        sample = sample[:-len(_ALL_FA)]
+    return sample
+
+
+# ── Cached file reads for the live checks of the panels ─────────────────────
+# Keyed by (path, kind) and invalidated by the file's modification time, so a
+# check that runs on every keystroke never re-reads an unchanged file.
+_FILE_CACHE: dict = {}
+
+
+def _cached(path: str, kind: str, loader):
+    """loader(path), cached; an error is cached too and raised again."""
+    try:
+        stamp = os.path.getmtime(path)
+    except OSError:
+        return []
+    hit = _FILE_CACHE.get((path, kind))
+    if hit is None or hit[0] != stamp:
+        try:
+            hit = (stamp, loader(path))
+        except Exception as exc:
+            hit = (stamp, exc)
+        _FILE_CACHE[(path, kind)] = hit
+    if isinstance(hit[1], Exception):
+        raise hit[1]
+    return hit[1]
+
+
+def fasta_headers(path: str) -> List[str]:
+    """Headers (without '>') of a FASTA file, [] if unreadable."""
+    def load(p):
+        opener = __import__("gzip").open if p.lower().endswith(".gz") else open
+        with opener(p, "rt", encoding="utf-8", errors="replace") as fh:
+            return [ln[1:].strip() for ln in fh if ln.startswith(">")]
+    try:
+        return _cached(path, "fasta", load)
+    except Exception:
+        return []
+
+
+def repeated_headers(headers, spaces_as_underscore: bool = False) -> Dict[str, int]:
+    """{header: copies} for every header that occurs more than once.
+
+    *spaces_as_underscore* compares headers as the BLAST panel submits them
+    (spaces become '_'), so two that differ only in spaces are one."""
+    counts: Dict[str, int] = {}
+    for h in headers:
+        key = h.replace(" ", "_") if spaces_as_underscore else h
+        counts[key] = counts.get(key, 0) + 1
+    return {h: n for h, n in counts.items() if n > 1}
+
+
+def repeated_note(repeats: Dict[str, int], limit: int = 3) -> str:
+    """'3 repeated header(s), e.g. a ×2, b ×2, c ×3' (the examples are capped)."""
+    if not repeats:
+        return ""
+    shown = ", ".join(f"{h[:40]}{'…' if len(h) > 40 else ''} ×{n}"
+                      for h, n in list(repeats.items())[:limit])
+    more = f" and {len(repeats) - limit} more" if len(repeats) > limit else ""
+    return f"{len(repeats)} repeated header(s), e.g. {shown}{more}"
+
+
+def fasta_repeats(path: str) -> Dict[str, int]:
+    """repeated_headers() of one FASTA file, cached while the file is unchanged."""
+    return _cached(path, "repeats", lambda p: repeated_headers(fasta_headers(p)))
+
+
+def table_column(path: str, column: str) -> List[str]:
+    """Non-empty values of one column of a table (.xlsx/.tsv/.csv), [] if absent."""
+    def load(p):
+        headers, rows = read_blast_rows(p)
+        if column not in headers:
+            return []
+        i = headers.index(column)
+        return [str(r[i]).strip() for r in rows
+                if i < len(r) and r[i] is not None and str(r[i]).strip()]
+    try:
+        return _cached(path, "col:" + column, load)
+    except Exception:
+        return []
+
+
+def read_tax_reference_cached(path: str):
+    """read_tax_reference for the live panel checks (same errors)."""
+    return _cached(path, "taxref", read_tax_reference)
+
+
+_ID_SEPARATORS = re.compile(r"[-_.\s]+")
+
+
+def reference_match_check(samples, ref: dict) -> Tuple[str, str, int, int]:
+    """How many of *samples* (sample IDs) the reference table knows.
+
+    Returns (message, colour, found, total); message is "" without samples.
+    Looks the IDs up as the run does (exact, then case-insensitive). When
+    some are missing it also tries ignoring '-', '_', '.' and spaces, to
+    point out the usual cause: the same codes written with different
+    separators in the data and in the reference (DNS-1343 vs DNS_1343)."""
+    samples = [s for s in dict.fromkeys(samples) if s]
+    if not samples or not ref:
+        return "", "", 0, 0
+    fmt_warn = reference_format_warning(ref)
+    if fmt_warn:
+        return fmt_warn, RED, 0, len(samples)
+    ref_lower = {k.lower() for k in ref}
+    missing = [s for s in samples if s not in ref and s.lower() not in ref_lower]
+    found = len(samples) - len(missing)
+    empty = reference_empty_ids(samples, ref)
+    empty_txt = (f" · {len(empty)} with empty taxonomy (e.g. {', '.join(empty[:3])})"
+                 if empty else "")
+    if not missing:
+        return (f"Reference check: all {found} sample ID(s) found in the reference"
+                f"{empty_txt}.", AMBER if empty else GREEN, found, len(samples))
+
+    def norm(x):
+        return _ID_SEPARATORS.sub("", x.lower())
+    ref_norm = {}
+    for k in ref:
+        ref_norm.setdefault(norm(k), k)
+    near = [(s, ref_norm[norm(s)]) for s in missing if norm(s) in ref_norm]
+    msg = (f"Reference check: {found} of {len(samples)} sample ID(s) found "
+           f"in the reference")
+    if near:
+        s, r = near[0]
+        msg += (f" · {len(near)} more would match if '-', '_', '.' and spaces were "
+                f"ignored (e.g. sample '{s}' vs reference '{r}'): use the same "
+                f"separators in both")
+    else:
+        msg += " · not found, e.g. " + ", ".join(missing[:3])
+    msg += empty_txt
+    return msg, (RED if found == 0 else AMBER), found, len(samples)
+
+
+def reference_format_warning(ref: dict) -> str:
+    """Warning when the reference does not look like ID + Order, Family,
+    Genus, Organism: taxon names carry no digits, so Order/Family/Genus
+    columns that are mostly numbers or codes mean the columns are not where
+    they should be (e.g. a lab sheet with plate / well columns after the ID).
+    "" when the layout looks right."""
+    values = [v for tax in ref.values() for v in tax[:3] if v]
+    if not values:
+        return ("Reference check: the Order / Family / Genus columns are empty — "
+                "the 4 columns after the identifier must hold Order, Family, Genus "
+                "and Organism.")
+    n_digit = sum(1 for v in values if any(ch.isdigit() for ch in v))
+    if n_digit / len(values) > 0.5:
+        example = next(iter(ref.values()))
+        return ("Reference check: the columns after the identifier look like numbers "
+                f"or codes, not taxa (e.g. {' / '.join(x for x in example if x)}) — "
+                "the identifier must be followed by Order, Family, Genus and Organism.")
+    return ""
+
+
+def reference_empty_ids(samples, ref: dict) -> List[str]:
+    """Samples found in the reference but with all four taxonomy cells empty:
+    they get no expected taxonomy, so none of their hits can be judged."""
+    ref_lower = {k.lower(): v for k, v in ref.items()}
+    out = []
+    for s in dict.fromkeys(samples):
+        tax = lookup_tax(s, ref, ref_lower) if s else None
+        if tax is not None and not any(tax):
+            out.append(s)
+    return out
+
+
+def reference_report_lines(samples, ref: dict, unknown=None, limit: int = 50) -> List[str]:
+    """Run-log lines naming the samples a run cannot judge taxonomically:
+    absent from the reference, present with empty taxonomy, plus a layout
+    warning. [] when everything is in order."""
+    lines = []
+    warn = reference_format_warning(ref)
+    if warn:
+        lines += ["", "  " + warn]
+    if unknown is None:
+        ref_lower = {k.lower() for k in ref}
+        unknown = [s for s in dict.fromkeys(samples)
+                   if s and s not in ref and s.lower() not in ref_lower]
+    for title, ids in (("Samples missing from the reference (no expected taxonomy):",
+                        sorted(unknown)),
+                       ("Samples in the reference with empty taxonomy:",
+                        reference_empty_ids(samples, ref))):
+        if ids:
+            lines += ["", f"  {title} {len(ids)}"]
+            lines += [f"    {x}" for x in ids[:limit]]
+            if len(ids) > limit:
+                lines.append(f"    … {len(ids) - limit} more")
+    return lines
+
+
 def lookup_tax(sample: str, ref: dict, ref_lower: dict):
     """Reference row of *sample*, matched exactly then case-insensitively."""
     tax = ref.get(sample)
@@ -108,7 +318,8 @@ def lookup_tax(sample: str, ref: dict, ref_lower: dict):
     return tax
 
 
-def apply_reference_tax(path: str, ref: dict, ref_lower: dict, strip_suffix: str = ""):
+def apply_reference_tax(path: str, ref: dict, ref_lower: dict, strip_suffix: str = "",
+                        ref_path: str = ""):
     """Write the four Query_* columns into a BLAST table, in place.
 
     Every row is keyed by the sample ID of its Query_name (the text before
@@ -117,18 +328,29 @@ def apply_reference_tax(path: str, ref: dict, ref_lower: dict, strip_suffix: str
     table are overwritten; the missing ones are appended at its right end,
     so the original layout and formatting are left alone.
 
+    An .xlsx from the BLAST panel also gets its Tax_level_match column and
+    its Summary and Best hit sheets brought up to date (*ref_path* is the
+    reference file named in the Summary).
+
     Returns (rows seen, rows filled, sample IDs absent from the reference).
     """
     if path.lower().endswith(".xlsx"):
-        return _apply_reference_xlsx(path, ref, ref_lower, strip_suffix)
+        return _apply_reference_xlsx(path, ref, ref_lower, strip_suffix, ref_path)
     return _apply_reference_text(path, ref, ref_lower, strip_suffix)
 
 
-def _apply_reference_xlsx(path, ref, ref_lower, strip_suffix: str = ""):
+# Hit (Subject_*) taxonomy columns of a BLAST panel table, in the order of
+# the "order"/"family"/"genus"/"organism" ranks of concordance_level.
+_SUBJECT_RANK_COLUMNS = ("Subject_Order", "Subject_Family", "Subject_Genus",
+                         "Subject_organism")
+
+
+def _apply_reference_xlsx(path, ref, ref_lower, strip_suffix: str = "",
+                          ref_path: str = ""):
     import openpyxl
     from copy import copy
     wb = openpyxl.load_workbook(path)
-    sheet = wb[wb.sheetnames[0]]
+    sheet = blast_sheet(wb)
     header_row = next(sheet.iter_rows(min_row=1, max_row=1), ())
     headers = [(str(c.value).strip() if c.value is not None else "")
                for c in header_row]
@@ -167,6 +389,35 @@ def _apply_reference_xlsx(path, ref, ref_lower, strip_suffix: str = ""):
             n_filled += 1
         for name, val in zip(QUERY_TAX_COLUMNS, tax):
             sheet.cell(row=row[0].row, column=col_idx[name], value=val)
+
+    # A BLAST panel table with hit taxonomy: keep its Tax_level_match (the
+    # deepest rank where hit and reference agree) in step with the new
+    # Query_* values, as the BLAST panel's own reference step does.
+    if all(c in headers for c in _SUBJECT_RANK_COLUMNS):
+        if "Tax_level_match" in headers:
+            m_col = headers.index("Tax_level_match") + 1
+        else:
+            m_col = next_col + 1
+            cell = sheet.cell(row=1, column=m_col, value="Tax_level_match")
+            cell._style = copy(style_src._style)
+        s_idx = [headers.index(c) + 1 for c in _SUBJECT_RANK_COLUMNS]
+        q_idx = [col_idx[c] for c in QUERY_TAX_COLUMNS]
+        ranks = ("order", "family", "genus", "organism")
+        for r in range(2, sheet.max_row + 1):
+            if not str(sheet.cell(row=r, column=q_i + 1).value or "").strip():
+                continue
+            hit = {k: display_taxon(sheet.cell(row=r, column=c).value)
+                   for k, c in zip(ranks, s_idx)}
+            qtax = {k: display_taxon(sheet.cell(row=r, column=c).value)
+                    for k, c in zip(ranks, q_idx)}
+            sheet.cell(row=r, column=m_col, value=concordance_level(hit, qtax))
+
+    # Its Summary and Best hit sheets are built from the hit table: rebuild
+    # them, or they would keep the previous reference's identifications.
+    from .blast_panel import refresh_summary_sheets
+    refresh_summary_sheets(wb, path, {"tax_reference": ref_path,
+                                      "strip_suffix": strip_suffix}
+                           if ref_path else None)
 
     tmp = path + ".tmp"
     wb.save(tmp)
@@ -304,6 +555,7 @@ _FLAG_HELP = {
     "no_blast_hit":          "(no hit at all in the BLAST table)",
     "hits_below_min_aln":    "(hits exist but all below the minimum alignment)",
     "tax_mismatch":          "(good hits, none matching the expected taxonomy)",
+    "no_query_taxonomy":     "(no expected taxonomy for the sample: Query_* empty)",
     "low_taxonomic_support": "(best hit matches only at order level)",
     "near_tie":              "(runner-up within 1 point of the winner)",
     "missing_in":            "(sample not recovered in every run)",
@@ -356,13 +608,63 @@ def _is_blast(path: str) -> bool:
     return path.lower().endswith(_BLAST_EXT)
 
 
+# Files a run's folder holds besides its FASTA + BLAST table. A dropped folder
+# is read one level deep, and these must not be taken for inputs: their FASTA
+# or table-like extensions would otherwise pair with the wrong file.
+_NOT_INPUT_PREFIXES = (
+    "missing_seqs_", "nohit_seqs_", "blast_run_log_", "blastfile_run_log_",
+    "bestseq-", "bestseq_run_log_", "secondary_variants", "~$",
+)
+
+
+def scan_folder(folder: str) -> Tuple[List[str], List[str]]:
+    """FASTA files and BLAST tables directly inside *folder* (subfolders are
+    not read), as (inputs, ignored names). Files a run writes beside its
+    results (see _NOT_INPUT_PREFIXES) are ignored, and where a table exists
+    as .xlsx and also as .tsv/.csv/.txt of the same name (the BLAST panel
+    writes both) the .xlsx is the one kept."""
+    try:
+        names = sorted(os.listdir(folder), key=str.lower)
+    except OSError:
+        return [], []
+    inputs, ignored = [], []
+    for name in names:
+        path = os.path.join(folder, name)
+        if not os.path.isfile(path) or not (_is_fasta(path) or _is_blast(path)):
+            continue
+        if name.lower().startswith(_NOT_INPUT_PREFIXES):
+            ignored.append(name)
+        else:
+            inputs.append(path)
+    xlsx_stems = {_stem(f) for f in inputs if f.lower().endswith(".xlsx")}
+    kept = []
+    for f in inputs:
+        if _is_blast(f) and not f.lower().endswith(".xlsx") and _stem(f) in xlsx_stems:
+            ignored.append(os.path.basename(f))
+        else:
+            kept.append(f)
+    return kept, ignored
+
+
+# Name of the hit table's sheet in the BLAST panel's .xlsx, which also carries
+# a Summary and a Best hit sheet ahead of it. Other tables use their first sheet.
+BLAST_RESULTS_SHEET = "BLAST Results"
+
+
+def blast_sheet(wb):
+    """The sheet of a workbook that holds the BLAST hit table."""
+    if BLAST_RESULTS_SHEET in wb.sheetnames:
+        return wb[BLAST_RESULTS_SHEET]
+    return wb[wb.sheetnames[0]]
+
+
 def read_blast_header(path: str) -> List[str]:
     """Return the column names of a BLAST table (.xlsx / .tsv / .csv)."""
     if path.lower().endswith(".xlsx"):
         try:
             import openpyxl
             wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-            sheet = wb[wb.sheetnames[0]]
+            sheet = blast_sheet(wb)
             row = next(sheet.iter_rows(values_only=True), ())
             wb.close()
             return [str(c).strip() if c is not None else "" for c in row]
@@ -382,7 +684,7 @@ def read_blast_rows(path: str) -> Tuple[List[str], List[tuple]]:
     if path.lower().endswith(".xlsx"):
         import openpyxl
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
-        sheet = wb[wb.sheetnames[0]]
+        sheet = blast_sheet(wb)
         rows = sheet.iter_rows(values_only=True)
         header = next(rows, ())
         headers = [str(c).strip() if c is not None else "" for c in header]
@@ -421,6 +723,10 @@ class _PairDropZone(QtWidgets.QFrame):
 
         self._fastas: List[str] = []
         self._blasts: List[str] = []
+        # Files that came from a dropped folder (paired by name only: see
+        # _match), and what was skipped from those folders, shown in the zone.
+        self._from_folder: set = set()
+        self._notices: List[str] = []
         self._seq_cache: Dict[str, int] = {}
         self._col_cache: Dict[str, List[str]] = {}
         # True when a taxonomy reference file is supplied: the Query_* columns
@@ -433,14 +739,16 @@ class _PairDropZone(QtWidgets.QFrame):
         layout.setSpacing(8)
 
         self._lbl_src_empty  = "Drag/Add FASTA + BLAST files here"
-        self._lbl_src_filled = "Comparisons"
+        self._lbl_src_filled = "Runs"
         self._lbl = make_label(self._lbl_src_empty, size=18, color=TEXT_SEC)
         self._lbl.setAlignment(QtCore.Qt.AlignCenter)
         self._lbl.setToolTip(
             "Drop every FASTA (.fa/.fas/.fasta) together with its BLAST table\n"
-            "(.xlsx/.tsv/.csv). Files are paired by name, so each pair must share\n"
-            "the same base name — e.g. run1.fa + run1.xlsx. A single FASTA and\n"
-            "a single table left without a match are paired anyway.\n"
+            "(.xlsx/.tsv/.csv), or the folders that hold them (only the files\n"
+            "directly inside each folder are read). Files are paired by name, so\n"
+            "each pair must share the same base name — e.g. run1.fa + run1.xlsx.\n"
+            "A single FASTA and a single table left without a match are paired\n"
+            "anyway, except when they come from a folder.\n"
             "One pair classifies that run; two or more compare them."
         )
 
@@ -519,6 +827,16 @@ class _PairDropZone(QtWidgets.QFrame):
         cols = set(self._columns(path))
         return [c for c in SUBJECT_TAX_COLUMNS if c not in cols]
 
+    def matched_in_table(self, fasta: str, blast: str) -> Tuple[int, int]:
+        """(FASTA headers found as a Query_name of the table, headers). The
+        run looks hits up by the full header (spaces as '_', as the BLAST
+        panel submits them), so an unmatched header gets no hits at all."""
+        headers = fasta_headers(fasta)
+        queries = set(table_column(blast, "Query_name"))
+        n = sum(1 for h in headers
+                if h in queries or h.replace(" ", "_") in queries)
+        return n, len(headers)
+
     def set_reference_mode(self, enabled: bool):
         """Accept tables without the Query_* columns (a reference file fills them)."""
         if enabled != self._ref_mode:
@@ -543,7 +861,11 @@ class _PairDropZone(QtWidgets.QFrame):
         used = {_stem(b) for b in match.values() if b}
         free_fa = [fa for fa, bl in match.items() if bl is None]
         free_bl = [s for s in blast_by_stem if s not in used]
-        if len(free_fa) == 1 and len(free_bl) == 1:
+        # Not for files from a folder: next to many others, the only two left
+        # over are as likely to be unrelated as a pair.
+        if (len(free_fa) == 1 and len(free_bl) == 1
+                and free_fa[0] not in self._from_folder
+                and blast_by_stem[free_bl[0]] not in self._from_folder):
             match[free_fa[0]] = blast_by_stem[free_bl[0]]
         return match
 
@@ -568,6 +890,13 @@ class _PairDropZone(QtWidgets.QFrame):
             return False, ("No hit taxonomy (Subject_* columns) in: "
                            + ", ".join(no_hit_tax[:3]) + ("…" if len(no_hit_tax) > 3 else "")
                            + " — re-run BLAST with 'Fetch organism + taxonomy' on.")
+        unmatched = [os.path.basename(p["fasta"]) for p in pairs
+                     if self.matched_in_table(p["fasta"], p["blast"])[0] == 0]
+        if unmatched:
+            return False, ("No sequence of " + ", ".join(unmatched[:3])
+                           + ("…" if len(unmatched) > 3 else "")
+                           + " is in its BLAST table (Query_name): check that the "
+                             "table belongs to that FASTA.")
         bad = [os.path.basename(p["blast"]) for p in pairs
                if self._missing_tax_columns(p["blast"])]
         if bad and not self._ref_mode:
@@ -611,6 +940,15 @@ class _PairDropZone(QtWidgets.QFrame):
         center.setSpacing(1)
         name_lbl = make_label(os.path.basename(fasta), size=15, color=TEXT_PRI)
         name_lbl.setWordWrap(False)
+        repeats = fasta_repeats(fasta)
+        if repeats:
+            # The run keeps the FIRST record of a repeated header (see _read_fasta).
+            name_lbl.setTextFormat(QtCore.Qt.RichText)
+            name_lbl.setText(
+                f"{__import__("html").escape(os.path.basename(fasta))}  <span style='color:#B45309;"
+                f" font-size:13px;'>⚠ {len(repeats)} repeated header(s) — "
+                f"only the first record of each is used</span>")
+            row.setToolTip(row.toolTip() + "\n\n" + repeated_note(repeats, 8))
         center.addWidget(name_lbl)
 
         n_seqs = self._count_seqs(fasta)
@@ -619,20 +957,33 @@ class _PairDropZone(QtWidgets.QFrame):
                 f"{n_seqs:,} sequences  ·  no BLAST table with this name — ignored",
                 size=14, color=RED)
         else:
+            n_in, n_all = self.matched_in_table(fasta, blast)
+            if n_in == 0:
+                in_table = "none in the BLAST table"
+            elif n_in < n_all:
+                in_table = f"{n_in:,} in the BLAST table"
+            else:
+                in_table = "all in the BLAST table"
+            n_seqs = f"{n_seqs:,} seqs ({in_table})"
             missing = self._missing_tax_columns(blast)
-            if missing and self._ref_mode:
+            if n_in == 0:
                 detail = make_label(
-                    f"{n_seqs:,} seqs  ·  📊 {os.path.basename(blast)}  ·  "
+                    f"{n_seqs}  ·  📊 {os.path.basename(blast)}  ·  "
+                    f"its Query_name values do not match these headers",
+                    size=14, color=RED)
+            elif missing and self._ref_mode:
+                detail = make_label(
+                    f"{n_seqs}  ·  📊 {os.path.basename(blast)}  ·  "
                     f"{', '.join(missing)} → will be written from the reference",
                     size=14, color=TEXT_HINT)
             elif missing:
                 detail = make_label(
-                    f"{n_seqs:,} seqs  ·  📊 {os.path.basename(blast)}  ·  "
+                    f"{n_seqs}  ·  📊 {os.path.basename(blast)}  ·  "
                     f"missing: {', '.join(missing)}",
                     size=14, color=RED)
             else:
                 detail = make_label(
-                    f"{n_seqs:,} seqs  ·  📊 {os.path.basename(blast)}  ·  "
+                    f"{n_seqs}  ·  📊 {os.path.basename(blast)}  ·  "
                     f"query taxonomy ✓",
                     size=14, color=TEXT_HINT)
         detail.setWordWrap(False)
@@ -640,7 +991,7 @@ class _PairDropZone(QtWidgets.QFrame):
 
         remove_btn = QtWidgets.QPushButton("✕")
         remove_btn.setFixedSize(26, 26)
-        remove_btn.setToolTip("Remove this comparison")
+        remove_btn.setToolTip("Remove this run")
         remove_btn.setStyleSheet(f"""
             QPushButton {{
                 background-color: transparent; color: {TEXT_HINT};
@@ -674,7 +1025,7 @@ class _PairDropZone(QtWidgets.QFrame):
         return list(self._match().items())
 
     def _adjust_height(self):
-        n = len(self._entries()) + len(self._orphans()[1])
+        n = len(self._entries()) + len(self._orphans()[1]) + len(self._notices)
         if n == 0:
             self.setFixedHeight(self._EMPTY_H)
         else:
@@ -689,7 +1040,7 @@ class _PairDropZone(QtWidgets.QFrame):
             if item.widget():
                 item.widget().deleteLater()
 
-        if not entries and not orphan_blasts:
+        if not entries and not orphan_blasts and not self._notices:
             self._rows_container.hide()
             self._clear_btn.hide()
             self._lbl.setText(_tr("BestSeqPairDropZone", self._lbl_src_empty))
@@ -703,6 +1054,11 @@ class _PairDropZone(QtWidgets.QFrame):
                     size=14, color=RED)
                 lbl.setContentsMargins(12, 4, 10, 4)
                 self._rows_layout.addWidget(lbl)
+            for note in self._notices:
+                lbl = make_label(note, size=14, color=RED)
+                lbl.setWordWrap(True)
+                lbl.setContentsMargins(12, 4, 10, 4)
+                self._rows_layout.addWidget(lbl)
             self._rows_container.show()
             self._clear_btn.show()
             n_pairs = len(self.pairs())
@@ -713,7 +1069,8 @@ class _PairDropZone(QtWidgets.QFrame):
             self.setProperty("filled", "true")
 
         _sp = QtWidgets.QSizePolicy
-        mode = _sp.Expanding if not entries and not orphan_blasts else _sp.Fixed
+        mode = (_sp.Expanding if not entries and not orphan_blasts and not self._notices
+                else _sp.Fixed)
         self._top_spacer.changeSize(0, 0, _sp.Minimum, mode)
         self._bot_spacer.changeSize(0, 0, _sp.Minimum, mode)
         self.layout().invalidate()
@@ -732,9 +1089,50 @@ class _PairDropZone(QtWidgets.QFrame):
         if files:
             self._add_files(files)
 
-    def _add_files(self, paths):
+    def _add_folders(self, folders):
+        """Add the FASTA files and BLAST tables directly inside each folder.
+
+        Pairs are matched by base name alone, so a base name that would come
+        from two places (two folders, or a folder and a file already loaded)
+        is not loaded at all: whichever pair it paired with could be the wrong
+        one, and one would silently replace the other. The zone says so."""
+        found, notes = [], []
+        for folder in folders:
+            files, ignored = scan_folder(folder)
+            name = os.path.basename(os.path.normpath(folder))
+            if not files:
+                notes.append(f"⚠  {name}: no FASTA or BLAST table directly inside it.")
+            if ignored:
+                notes.append(f"{name}: {len(ignored)} file(s) ignored (run outputs or "
+                             f"duplicate tables): {', '.join(ignored[:3])}"
+                             + ("…" if len(ignored) > 3 else ""))
+            found += files
+
+        have = [f for f in self._fastas + self._blasts if f not in found]
+        where: Dict[Tuple[bool, str], set] = {}
+        for f in found + have:
+            where.setdefault((_is_fasta(f), _stem(f)), set()).add(f)
+        clash = {k for k, v in where.items() if len(v) > 1 and any(f in found for f in v)}
+        if clash:
+            skipped = sorted({os.path.basename(f) for f in found
+                              if (_is_fasta(f), _stem(f)) in clash})
+            notes.append("⚠  Not loaded, the same name comes from more than one place: "
+                         + ", ".join(skipped[:4]) + ("…" if len(skipped) > 4 else "")
+                         + ". Click Clear if one is already loaded, then drop those folders one at a time.")
+            found = [f for f in found if (_is_fasta(f), _stem(f)) not in clash]
+
+        before = len(self._fastas) + len(self._blasts)
+        self._add_files(found, from_folder=True)
+        if notes or len(self._fastas) + len(self._blasts) == before:
+            self._notices.extend(n for n in notes if n not in self._notices)
+            self._update_display()
+            self.pairsChanged.emit(self.pairs())
+
+    def _add_files(self, paths, from_folder: bool = False):
         added = 0
         for p in paths:
+            if from_folder:
+                self._from_folder.add(p)
             if _is_fasta(p):
                 if p not in self._fastas:
                     self._fastas.append(p)
@@ -772,13 +1170,18 @@ class _PairDropZone(QtWidgets.QFrame):
         self._drag_icon_lbl.hide()
         refresh_style(self)
         paths = [u.toLocalFile() for u in e.mimeData().urls()]
-        paths = [p for p in paths if p and (_is_fasta(p) or _is_blast(p))]
-        if paths:
-            self._add_files(paths)
+        folders = [p for p in paths if p and os.path.isdir(p)]
+        files = [p for p in paths if p and not os.path.isdir(p) and (_is_fasta(p) or _is_blast(p))]
+        if files:
+            self._add_files(files)
+        if folders:
+            self._add_folders(folders)
 
     def clear(self):
         self._fastas = []
         self._blasts = []
+        self._from_folder = set()
+        self._notices = []
         self._seq_cache = {}
         self._col_cache = {}
         self._update_display()
@@ -840,20 +1243,24 @@ class _RefDropZone(QtWidgets.QFrame):
 
     _HINT = "Drag the reference file here  (.csv, .xlsx, .tsv)"
 
+    # Empty: white, with the same dashed line as the drop zones above it, so it
+    # stands out from the grey panel and the spot to drop the file is not lost.
+    # Dragging a file over it greys the fill and turns the line blue, as in
+    # those zones; one that cannot be used, red; a loaded file is green.
     _QSS = f"""
     QFrame#ref_drop_zone {{
-        background-color: {GRAY_BG};
-        border: 1px dashed #D8D8D4;
+        background-color: {WHITE};
+        border: 2px dashed #E6E6E3;
         border-radius: 8px;
         padding: 4px 10px;
     }}
     QFrame#ref_drop_zone[dragging="true"] {{
-        background-color: #EBEBEA;
-        border: 1px dashed {BLUE_MID};
+        background-color: {DROP_DRAG_BG};
+        border: {DROP_DRAG_BORDER};
     }}
     QFrame#ref_drop_zone[dragging="invalid"] {{
         background-color: {RED_LT};
-        border: 1px dashed {RED};
+        border: 2px dashed {RED};
     }}
     QFrame#ref_drop_zone[filled="true"] {{
         background-color: {GREEN_LT};
@@ -981,7 +1388,7 @@ class BestSeqPanel(QtWidgets.QWidget):
     bestSeqRequested = QtCore.pyqtSignal(list, dict)   # pairs, config dict
     stopRequested    = QtCore.pyqtSignal()             # user clicked Stop
 
-    _SLOT_KEYS = ("info", "files", "identical", "select", "progress", "result")
+    _SLOT_KEYS = ("info", "files", "identical", "select", "progress", "result", "review")
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1036,11 +1443,11 @@ class BestSeqPanel(QtWidgets.QWidget):
         )
         self._lbl_req.setWordWrap(True)
         self._lbl_req.setStyleSheet("color:#B45309; font-size:16px;")
-        self._layout.addWidget(self._lbl_req)
+        self._lbl_req.hide()   # shown only while a table lacks the Query_* columns
 
         # ── Settings group ──
         self._settings_box = QtWidgets.QGroupBox("Selection Settings")
-        self._settings_box.setStyleSheet("QGroupBox { font-weight:600; color:#1A1A2E; }")
+        self._settings_box.setStyleSheet(group_box_style())
         sg = QtWidgets.QFormLayout(self._settings_box)
         sg.setLabelAlignment(QtCore.Qt.AlignRight)
         sg.setSpacing(10)
@@ -1065,7 +1472,17 @@ class BestSeqPanel(QtWidgets.QWidget):
             "This suffix is removed from it, e.g. DNS-1343_all.fa;758;807 → DNS-1343."
         )
         self._lbl_suffix = QtWidgets.QLabel("Strip suffix from sample ID:")
-        sg.addRow(self._lbl_suffix, self._suffix_edit)
+        self._lbl_sample_preview = QtWidgets.QLabel("")
+        self._lbl_sample_preview.setTextFormat(QtCore.Qt.RichText)
+        self._lbl_sample_preview.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
+        suffix_row = QtWidgets.QWidget()
+        sr = QtWidgets.QHBoxLayout(suffix_row)
+        sr.setContentsMargins(0, 0, 0, 0)
+        sr.setSpacing(12)
+        sr.addWidget(self._suffix_edit)
+        sr.addWidget(self._lbl_sample_preview, 1)
+        sg.addRow(self._lbl_suffix, suffix_row)
+        self._suffix_edit.textChanged.connect(self._on_suffix_changed)
 
         # ── Optional query-taxonomy reference file ──
         # Without it every BLAST table must already carry the Query_* columns.
@@ -1092,8 +1509,6 @@ class BestSeqPanel(QtWidgets.QWidget):
         self._lbl_ref_info.hide()
         sg.addRow(self._lbl_ref_info)
 
-        self._layout.addWidget(self._settings_box)
-
         # ── Scoring explanation ──
         self._lbl_rule = make_label(
             "Score (when comparing two or more runs) = taxonomic rank of the "
@@ -1105,9 +1520,9 @@ class BestSeqPanel(QtWidgets.QWidget):
             "The weights are fixed: taxonomic concordance always outranks raw score.",
             size=15, color=TEXT_HINT)
         self._lbl_rule.setWordWrap(True)
-        self._layout.addWidget(make_collapsible(self._lbl_rule, "How the score works"))
+        rule_box = make_collapsible(self._lbl_rule, "How the score works")
 
-        # ── Drop zone ──
+        # ── Drop zone (first: the settings below preview its files) ──
         self._drop = _PairDropZone()
         self._drop.pairsChanged.connect(self._on_pairs)
         self._layout.addWidget(self._drop)
@@ -1115,6 +1530,9 @@ class BestSeqPanel(QtWidgets.QWidget):
         self._lbl_status = make_label("", size=15, color=RED)
         self._lbl_status.setWordWrap(True)
         self._layout.addWidget(self._lbl_status)
+        self._layout.addWidget(self._lbl_req)
+        self._layout.addWidget(self._settings_box)
+        self._layout.addWidget(rule_box)
         self._layout.addStretch()
 
         # ── Live progress display ──
@@ -1160,14 +1578,14 @@ class BestSeqPanel(QtWidgets.QWidget):
         self._clear_btn.clicked.connect(self._reset)
         fl.addWidget(self._clear_btn)
 
-        self._open_folder_btn = QtWidgets.QPushButton("Open folder  📂")
+        self._open_folder_btn = QtWidgets.QPushButton("Open folder")
         self._open_folder_btn.setObjectName("secondary_btn")
         self._open_folder_btn.setFixedHeight(44)
         self._open_folder_btn.hide()
         self._open_folder_btn.clicked.connect(self._open_output_folder)
         fl.addWidget(self._open_folder_btn)
 
-        self._open_results_btn = QtWidgets.QPushButton("Open results  📄")
+        self._open_results_btn = QtWidgets.QPushButton("Open results")
         self._open_results_btn.setObjectName("secondary_btn")
         self._open_results_btn.setFixedHeight(44)
         self._open_results_btn.hide()
@@ -1197,6 +1615,7 @@ class BestSeqPanel(QtWidgets.QWidget):
         self._last_outdir = ""
         self._last_report = ""
         self._ref_ok = False          # reference file present and readable
+        self._ref_found = None        # sample IDs found in it (None: not checked)
         self._describe_reference()
 
         self.installEventFilter(self)
@@ -1247,9 +1666,9 @@ class BestSeqPanel(QtWidgets.QWidget):
         self._ref_check.setText(_tr(ctx, "I have a reference file with the query taxonomy"))
         self._ref_zone.retranslateUi()
         self._clear_btn.setText(_tr(ctx, "Clear"))
-        self._open_folder_btn.setText(_tr(ctx, "Open folder  📂"))
-        self._open_results_btn.setText(_tr(ctx, "Open results  📄"))
-        self._run_btn.setText(_tr(ctx, "Select best sequences  →"))
+        self._open_folder_btn.setText(_tr(ctx, "Open folder"))
+        self._open_results_btn.setText(_tr(ctx, "Open results"))
+        self._run_btn.setText(_tr(ctx, self._run_text()))
         self._drop.retranslateUi()
 
     def changeEvent(self, event):
@@ -1271,8 +1690,40 @@ class BestSeqPanel(QtWidgets.QWidget):
         self._drop.set_reference_mode(self._ref_check.isChecked() and self._ref_ok)
         self._on_pairs(None)
 
+    def _run_text(self) -> str:
+        """One run is classified; two or more are compared."""
+        return ("Classify sequences  →" if len(self._drop.pairs()) == 1
+                else "Select best sequences  →")
+
+    def _on_suffix_changed(self, *_):
+        self._update_sample_preview()
+        if self._ref_check.isChecked():
+            self._describe_reference()
+
+    def _update_sample_preview(self):
+        """'header → sample' for the first loaded FASTA, so the grouping is
+        visible before running."""
+        pairs = self._drop.pairs()
+        headers = fasta_headers(pairs[0]["fasta"]) if pairs else []
+        if not headers:
+            self._lbl_sample_preview.setText("")
+            return
+        h = headers[0]
+        shown = h if len(h) <= 40 else h[:40] + "…"
+        sample = sample_of_header(h, self._suffix_edit.text().strip())
+        self._lbl_sample_preview.setText(
+            f"{shown}  →  sample <b style='color:{BLUE}'>{sample or '—'}</b>")
+
+    def _reference_samples(self) -> List[str]:
+        """Sample IDs the reference file must know: those of the FASTA
+        headers, derived as the run does for the BLAST Query_name."""
+        suffix = self._suffix_edit.text().strip()
+        return [sample_id_of(h, suffix)
+                for p in self._drop.pairs() for h in fasta_headers(p["fasta"])]
+
     def _describe_reference(self):
         """Validate the reference file and describe how it will be read."""
+        self._ref_found = None
         self._ref_ok = False
         path = self._ref_zone.path
         if not path:
@@ -1285,22 +1736,31 @@ class BestSeqPanel(QtWidgets.QWidget):
             self._lbl_ref_info.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
             return
         try:
-            id_col, tax_cols, table = read_tax_reference(path)
+            id_col, tax_cols, table = read_tax_reference_cached(path)
         except Exception as exc:
             self._lbl_ref_info.setText(f"⚠  {exc}")
             self._lbl_ref_info.setStyleSheet(f"color:{RED}; font-size:14px;")
             return
         self._ref_ok = True
+        check, colour, found, total = reference_match_check(
+            self._reference_samples(), table)
+        if total:
+            self._ref_found = found
         self._lbl_ref_info.setText(
             f"{len(table):,} entries  ·  identifier: <b>{id_col}</b>  ·  "
             f"<b>{' · '.join(tax_cols)}</b> → Query_Order · Query_Family · "
             f"Query_Genus · Query_organism.<br>"
-            f"These columns will be written into every BLAST table dropped below "
+            f"These columns will be written into every BLAST table dropped above "
             f"(the files are modified in place)."
+            + (f"<br><span style='color:{colour}'><b>{check}</b></span>" if check else "")
         )
         self._lbl_ref_info.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
 
     def _on_pairs(self, pairs=None):
+        self._update_sample_preview()
+        if self._ref_check.isChecked():
+            self._describe_reference()
+        self._run_btn.setText(_tr("BestSeqPanel", self._run_text()))
         ok, msg = self._drop.is_valid()
         # The reference file is what makes a table without Query_* columns
         # acceptable, so its own problems are reported first.
@@ -1315,10 +1775,25 @@ class BestSeqPanel(QtWidgets.QWidget):
         self._lbl_status.setStyleSheet(
             f"color:{TEXT_HINT};" if ok else f"color:{RED};"
         )
+        # The requirement note only matters while a table lacks the columns
+        # and no usable reference file will write them.
+        need = any(self._drop._missing_tax_columns(p["blast"])
+                   for p in self._drop.pairs())
+        self._lbl_req.setVisible(
+            need and not (self._ref_check.isChecked() and self._ref_ok))
         self._run_btn.setEnabled(ok)
         self._set_run_style(ok)
 
     def _emit_run(self):
+        if (self._ref_check.isChecked() and self._ref_found == 0
+                and QtWidgets.QMessageBox.question(
+                    self, "Reference file",
+                    "No sample ID of the FASTA files was found in the reference "
+                    "file, so no query taxonomy would be written (see the check "
+                    "in the settings).\n\nRun anyway?",
+                    QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                    QtWidgets.QMessageBox.No) != QtWidgets.QMessageBox.Yes):
+            return
         # The scoring weights are design constants (see the module header),
         # not user settings; they travel in cfg so the worker and the run log
         # keep reporting the values actually applied.
@@ -1350,6 +1825,8 @@ class BestSeqPanel(QtWidgets.QWidget):
         self._log.clear()
         self._log.hide()
         self._lbl_status.setText("")
+        self._lbl_req.hide()
+        self._lbl_sample_preview.setText("")
         self._open_folder_btn.hide()
         self._open_results_btn.hide()
         self._stop_btn.hide()
@@ -1362,6 +1839,21 @@ class BestSeqPanel(QtWidgets.QWidget):
 
     # ── Public API (called by MainWindow) ──────────────────────────────────
 
+    def load_run(self, paths: List[str]) -> bool:
+        """Start a fresh selection with *paths* (a FASTA and its BLAST table,
+        e.g. handed over by the BLAST panel): whatever an earlier selection left
+        in the panel (files, log, result buttons) is cleared first, so the
+        files come in as a single run and are classified, not compared with
+        the previous ones. Returns False, leaving the panel as it is, while a
+        run is in progress."""
+        # isHidden(), not isVisible(): the panel is behind BLAST when this is
+        # called, so isVisible() is False even while a run is in progress.
+        if not self._stop_btn.isHidden():
+            return False
+        self._reset()
+        self._drop._add_files(paths)
+        return True
+
     def _rebuild_log(self):
         sep = "─" * 56
         lines = [
@@ -1373,6 +1865,7 @@ class BestSeqPanel(QtWidgets.QWidget):
             self._log_slots.get("progress",  ""),
             sep,
             self._log_slots.get("result",    ""),
+            self._log_slots.get("review",    ""),
         ]
         self._log.setPlainText("\n".join(lines))
 
@@ -1468,10 +1961,20 @@ class _BestSeqWorker(QtCore.QThread):
     (Query_Order / Query_Family / Query_Genus / Query_organism, which must be
     present on every hit row) with the classification of the subject.
 
-    The selected sequences are written to three FASTA files: '_all', and a split
-    of it into '_identified' (best hit concordant at some rank) and
-    '_no_tax_hit' (no rank matched). The split is decided by taxonomy alone —
-    being identical in every run makes a consensus reproducible, not identified.
+    A secondary variant only replaces its sample's barcode when the top hit of
+    the variant reaches a deeper taxonomic level than the top hit of the
+    barcode. Otherwise both identify the same taxon and the bit-score gap is
+    noise (a variant 1-2 bases away from the barcode), so the barcode is kept.
+
+    The selected sequences are written to '_all', split by why they are or are
+    not identified: '_identified' (best hit concordant at some rank),
+    '_no_blast_hit' (BLAST found nothing similar: no hit, or only hits shorter
+    than the minimum alignment) and '_tax_mismatch' (good hits that contradict
+    the expected taxonomy). A sequence with hits but no expected taxonomy to
+    compare them with (sample missing from the reference, or empty there) also
+    goes to '_tax_mismatch', flagged 'no_query_taxonomy' in the report. The
+    split is decided by taxonomy alone — being identical in every run makes a
+    consensus reproducible, not identified.
     """
 
     statusUpdated   = QtCore.pyqtSignal(str, str)   # (slot_key, text)
@@ -1572,12 +2075,9 @@ class _BestSeqWorker(QtCore.QThread):
         Secondary variants (DNS-1343_var1;type=corrected;len=..;coverage=..;
         fixed_indels=..;Ns=..) map to their host sample and the same metrics."""
         parts = header.split(";")
-        sample = sample_id_of(header, self.cfg.get("strip_suffix", ""))
         # A consensus is '{sample}_all.fa' and its variants '{sample}_var{i}':
-        # group them under one sample even when the suffix field was cleared,
-        # or each would get its own winner.
-        if sample.endswith("_all.fa") and len(sample) > len("_all.fa"):
-            sample = sample[:-len("_all.fa")]
+        # grouped under one sample even when the suffix field was cleared.
+        sample = sample_of_header(header, self.cfg.get("strip_suffix", ""))
         # ambs stays None when the header has no 'ambs='/'Ns=' field; the
         # caller then counts the ambiguities in the sequence itself.
         info = {"sample": sample, "length": None, "reads": None,
@@ -1627,7 +2127,34 @@ class _BestSeqWorker(QtCore.QThread):
 
     def _apply_reference_tax(self, path: str, ref: dict, ref_lower: dict):
         """Write the four Query_* columns into a BLAST table, in place."""
-        return apply_reference_tax(path, ref, ref_lower, self.cfg.get("strip_suffix", ""))
+        return apply_reference_tax(path, ref, ref_lower, self.cfg.get("strip_suffix", ""),
+                                   self.cfg.get("tax_reference", ""))
+
+    def _sync_blast_tsv(self, path: str, ref: dict, ref_lower: dict) -> str:
+        """After the reference went into a BLAST .xlsx, write it into the .tsv
+        of the same name too (the BLAST panel's pair), so the two agree and an
+        .xlsx rebuilt from the .tsv later keeps it. Each file is edited in
+        place: rebuilding the .xlsx from the .tsv instead would drop whatever
+        was changed in it by hand. Returns the run-log line ("" when there is
+        no such .tsv); a failure is a warning, since this run reads the .xlsx."""
+        if not path.lower().endswith(".xlsx"):
+            return ""
+        tsv_path = os.path.splitext(path)[0] + ".tsv"
+        if not os.path.isfile(tsv_path):
+            return ""
+        from .blast_panel import apply_reference_and_tax_match
+        tsv_name = os.path.basename(tsv_path)
+        try:
+            n_rows, n_filled, _unknown, _n_match = apply_reference_and_tax_match(
+                tsv_path, ref, ref_lower, self.cfg.get("strip_suffix", ""))
+        except PermissionError:
+            msg = f"{tsv_name} not updated: open in another program"
+        except Exception as exc:
+            msg = f"{tsv_name} not updated: {exc}"
+        else:
+            return f"{tsv_name} updated too: {n_filled}/{n_rows} rows filled"
+        self.statusUpdated.emit("files", f"Warning     │ {msg}")
+        return "⚠ " + msg
 
     def _load_blast(self, path: str) -> Tuple[Dict[str, List[dict]],
                                               Dict[str, dict],
@@ -1882,7 +2409,7 @@ class _BestSeqWorker(QtCore.QThread):
         n_files = len(self.pairs)
         self.statusUpdated.emit(
             "info",
-            f"Comparisons: {n_files}  │  Min alignment: {cfg.get('min_alignment', 100)} bp"
+            f"Runs: {n_files}  │  Min alignment: {cfg.get('min_alignment', 100)} bp"
             f"  │  Bit weight: {bit_weight:g}"
         )
 
@@ -1932,17 +2459,23 @@ class _BestSeqWorker(QtCore.QThread):
                     + (f" · {len(unknown)} sample(s) not in the reference"
                        if unknown else "")
                 )
+                tsv_line = self._sync_blast_tsv(pair["blast"], ref_table, ref_lower)
+                if tsv_line:
+                    ref_lines.append(f"      {tsv_line}")
+            _fmt = reference_format_warning(ref_table)
+            if _fmt:
+                self.statusUpdated.emit("files", "Warning     │ " + _fmt)
             if all_unknown:
                 self.statusUpdated.emit(
                     "files",
                     f"Reference   │ Query taxonomy written · {len(all_unknown)} "
                     f"sample(s) not found in the reference"
                 )
-                ref_lines += ["", "    Samples missing from the reference:"]
-                for sample in sorted(all_unknown)[:50]:
-                    ref_lines.append(f"      {sample}")
-                if len(all_unknown) > 50:
-                    ref_lines.append(f"      … {len(all_unknown) - 50} more")
+            if all_unknown or _fmt:
+                # Empty-taxonomy samples are listed once the run's samples
+                # are known (after loading, below).
+                ref_lines += reference_report_lines([], ref_table,
+                                                    unknown=all_unknown)
             else:
                 self.statusUpdated.emit(
                     "files",
@@ -1956,6 +2489,7 @@ class _BestSeqWorker(QtCore.QThread):
         # ── Load every FASTA + BLAST pair ──
         candidates: Dict[str, List[dict]] = {}
         dup_lines: List[str] = []   # run-log lines for FASTAs with repeated headers
+        nomatch_lines: List[str] = []   # FASTAs whose headers are missing from the table
         file_labels: List[str] = []
         total_seqs = 0
         for i, pair in enumerate(self.pairs):
@@ -1976,6 +2510,19 @@ class _BestSeqWorker(QtCore.QThread):
                     f"Warning     │ {os.path.basename(pair['fasta'])}: {len(dups)} "
                     f"repeated header(s) ignored (first record kept)")
             blast, query_tax, raw_counts = self._load_blast(pair["blast"])
+            # Hits are looked up by the full header: say so when headers are
+            # absent from the table, or those sequences silently get no hits.
+            n_in = sum(1 for h in seqs
+                       if h in raw_counts or h.replace(" ", "_") in raw_counts)
+            if n_in < len(seqs):
+                nomatch_lines.append(
+                    f"    {os.path.basename(pair['fasta'])}: {len(seqs) - n_in} of "
+                    f"{len(seqs)} header(s) not in {os.path.basename(pair['blast'])}")
+                if n_in == 0:
+                    self.statusUpdated.emit(
+                        "files",
+                        f"Warning     │ {os.path.basename(pair['fasta'])}: no header found "
+                        f"in its BLAST table (Query_name) — every sequence gets no hit")
             total_seqs += len(seqs)
             for header, seq in seqs.items():
                 info = self._parse_header(header)
@@ -1991,10 +2538,15 @@ class _BestSeqWorker(QtCore.QThread):
                 hits = blast.get(qkey, [])
                 qtax = query_tax.get(qkey, _EMPTY_TAX)
                 best_hit, level = self._evaluate(hits, qtax)
+                # Level of the TOP hit (highest bit score), used to decide
+                # whether a secondary variant really beats the barcode.
+                top_level = (concordance_level(max(hits, key=lambda h: h["bit"]), qtax)
+                             if hits else "none")
                 candidates.setdefault(info["sample"], []).append({
                     "file": label, "header": header, "seq": seq, "info": info,
                     "n_hits": len(hits), "n_hits_raw": raw_counts.get(qkey, 0),
                     "qtax": qtax, "best_hit": best_hit, "level": level,
+                    "top_level": top_level,
                 })
             self._emit_progress(0.5 * (i + 1) / n_files)
 
@@ -2008,21 +2560,33 @@ class _BestSeqWorker(QtCore.QThread):
 
         self.statusUpdated.emit(
             "files",
-            f"Loaded      │ {n_files} comparisons · {total_seqs} sequences · "
+            f"Loaded      │ {n_files} runs · {total_seqs} sequences · "
             f"{len(candidates)} samples"
         )
+        if ref_path:
+            _empty = reference_empty_ids(list(candidates), ref_table)
+            if _empty:
+                ref_lines += ["", f"  Samples in the reference with empty taxonomy: {len(_empty)}"]
+                ref_lines += [f"    {x}" for x in _empty[:50]]
+                self.statusUpdated.emit(
+                    "files", f"Warning     │ {len(_empty)} sample(s) with empty taxonomy "
+                             f"in the reference (e.g. {', '.join(_empty[:3])})")
 
         # ── Output files ──
         tsv_path = os.path.join(output_dir, f"bestseq-{mydate}.tsv")
         fa_all   = os.path.join(output_dir, f"bestseq-{mydate}_all.fasta")
         fa_id    = os.path.join(output_dir, f"bestseq-{mydate}_identified.fasta")
-        fa_noid  = os.path.join(output_dir, f"bestseq-{mydate}_no_tax_hit.fasta")
+        fa_nohit = os.path.join(output_dir, f"bestseq-{mydate}_no_blast_hit.fasta")
+        fa_mism  = os.path.join(output_dir, f"bestseq-{mydate}_tax_mismatch.fasta")
 
         n_samples   = len(candidates)
         n_identical = 0
         n_selected  = 0
         n_single    = 0
-        n_written   = {"all": 0, "identified": 0, "no_tax": 0}
+        n_one_run   = 0
+        n_written   = {"all": 0, "identified": 0, "no_blast_hit": 0,
+                       "below_min_aln": 0, "tax_mismatch": 0, "no_query_tax": 0}
+        n_variant_overruled = 0   # variants that won on score with no taxonomic gain
         level_counts = {lvl: 0 for lvl in TAX_LEVELS}
         flag_counts: Dict[str, int] = {}
 
@@ -2030,7 +2594,8 @@ class _BestSeqWorker(QtCore.QThread):
             fh_tsv   = open(tsv_path, "w", encoding="utf-8")
             fh_all   = open(fa_all,   "w", encoding="utf-8")
             fh_id    = open(fa_id,    "w", encoding="utf-8")
-            fh_noid  = open(fa_noid,  "w", encoding="utf-8")
+            fh_nohit = open(fa_nohit, "w", encoding="utf-8")
+            fh_mism  = open(fa_mism,  "w", encoding="utf-8")
         except PermissionError as e:
             self.taskError.emit(f"Could not write output files (locked/permission denied):\n{e}")
             return
@@ -2042,7 +2607,7 @@ class _BestSeqWorker(QtCore.QThread):
                 if self._stop:
                     break
                 cands = candidates[sample]
-                identical = len({c["seq"] for c in cands}) == 1
+                identical = len({c["seq"].upper() for c in cands}) == 1
 
                 max_bit = max((c["best_hit"]["bit"] if c["best_hit"] else 0.0)
                               for c in cands) or 1.0
@@ -2058,6 +2623,18 @@ class _BestSeqWorker(QtCore.QThread):
                                           -(c["info"]["length"] or 0),
                                           -(c["info"]["reads"] or 0),
                                           c["file"]))
+                # A secondary variant only beats the barcode with a real
+                # taxonomic gain: its top hit must reach a deeper level than
+                # the top hit of the best barcode candidate. Otherwise both
+                # point to the same taxon and the score gap is noise.
+                if is_variant_header(cands[0]["header"]):
+                    bc = next((c for c in cands if not is_variant_header(c["header"])),
+                              None)
+                    if bc is not None and (self.TAX_BONUS[cands[0]["top_level"]]
+                                           <= self.TAX_BONUS[bc["top_level"]]):
+                        cands.remove(bc)
+                        cands.insert(0, bc)
+                        n_variant_overruled += 1
                 best      = cands[0]
                 runner_up = cands[1] if len(cands) > 1 else None
 
@@ -2070,6 +2647,10 @@ class _BestSeqWorker(QtCore.QThread):
                     # taxonomic match, not chosen against other runs.
                     decision = "single_run"
                     n_single += 1
+                elif identical and n_files > 1 and n_cand_files == 1:
+                    # Recovered in one run only: nothing to be identical to.
+                    decision = "only_one_run"
+                    n_one_run += 1
                 elif identical:
                     decision = ("identical_in_all_runs" if in_all_files
                                 else "identical_in_available_runs")
@@ -2088,6 +2669,10 @@ class _BestSeqWorker(QtCore.QThread):
                 if best["n_hits"] == 0:
                     flags.append("hits_below_min_aln" if best["n_hits_raw"]
                                  else "no_blast_hit")
+                elif not any(best["qtax"].values()):
+                    # Nothing to compare the hits with (e.g. the sample is
+                    # missing from the reference file): not a mismatch.
+                    flags.append("no_query_taxonomy")
                 elif best["level"] == "none":
                     flags.append("tax_mismatch")
                 elif best["level"] == "order":
@@ -2138,15 +2723,27 @@ class _BestSeqWorker(QtCore.QThread):
                 # sequence identical in every run is a reproducible consensus,
                 # not a verified identification, so it only reaches
                 # '_identified' if its hits actually match the expected taxonomy.
+                # Not identified is split by WHY: BLAST found nothing similar
+                # (no hit / only short hits) vs. similar sequences of another
+                # taxon (contamination / mislabelling candidate).
                 record = ">%s\n%s\n" % (best["header"], best["seq"])
                 fh_all.write(record)
                 n_written["all"] += 1
                 if best["level"] != "none":
                     fh_id.write(record)
                     n_written["identified"] += 1
+                elif best["n_hits"] == 0:
+                    fh_nohit.write(record)
+                    n_written["no_blast_hit"] += 1
+                    if best["n_hits_raw"]:
+                        n_written["below_min_aln"] += 1
                 else:
-                    fh_noid.write(record)
-                    n_written["no_tax"] += 1
+                    # Includes hits with no expected taxonomy to compare with
+                    # (flag no_query_taxonomy): not identified, for review.
+                    fh_mism.write(record)
+                    n_written["tax_mismatch"] += 1
+                    if not any(best["qtax"].values()):
+                        n_written["no_query_tax"] += 1
 
                 self._emit_progress(0.5 + 0.5 * done / n_samples)
                 if done % 25 == 0 or done == n_samples:
@@ -2158,11 +2755,26 @@ class _BestSeqWorker(QtCore.QThread):
                         f"{n_identical} identical · {n_selected} decided by BLAST"
                     )
         finally:
-            for fh in (fh_tsv, fh_all, fh_id, fh_noid):
+            for fh in (fh_tsv, fh_all, fh_id, fh_nohit, fh_mism):
                 try:
                     fh.close()
                 except Exception:
                     pass
+
+        # A FASTA that received no sequence is not left behind as an empty file.
+        fa_counts = {fa_all: "all", fa_id: "identified",
+                     fa_nohit: "no_blast_hit", fa_mism: "tax_mismatch"}
+        for fa_path, key in fa_counts.items():
+            if n_written[key] == 0:
+                try:
+                    os.remove(fa_path)
+                except OSError:
+                    pass
+
+        def _fa_line(fa_path, key):
+            n = n_written[key]
+            return (f"{os.path.basename(fa_path)}  ({n} seqs)" if n
+                    else "none (0 seqs, file not written)")
 
         if n_files == 1:
             self.statusUpdated.emit(
@@ -2173,11 +2785,12 @@ class _BestSeqWorker(QtCore.QThread):
             self.statusUpdated.emit(
                 "identical",
                 f"Identical   │ {n_identical} sample(s) identical across runs"
+                + (f" · {n_one_run} found in one run only" if n_one_run else "")
             )
             self.statusUpdated.emit(
                 "select",
-                f"Selected    │ {n_identical + n_selected}/{n_samples} samples · "
-                f"{n_selected} decided by BLAST"
+                f"Selected    │ {n_identical + n_selected + n_one_run}/{n_samples} "
+                f"samples · {n_selected} decided by BLAST"
             )
 
         xlsx_path = self._tsv_to_xlsx(tsv_path)
@@ -2188,9 +2801,26 @@ class _BestSeqWorker(QtCore.QThread):
         kept = "sequences" if n_files == 1 else "best sequences"
         result_msg = (
             f"{status_str}   │ {n_written['all']} {kept} · "
-            f"{n_written['identified']} identified · {n_written['no_tax']} without taxonomic hit"
+            f"{n_written['identified']} identified · "
+            f"{n_written['no_blast_hit']} no BLAST hit · "
+            f"{n_written['tax_mismatch']} taxonomic mismatch"
+            + (f" ({n_written['no_query_tax']} without expected taxonomy)"
+               if n_written["no_query_tax"] else "")
         )
         self.statusUpdated.emit("result", result_msg)
+
+        # What deserves a manual look, most important first.
+        review = []
+        for key in ("tax_mismatch", "no_query_taxonomy", "no_blast_hit",
+                    "hits_below_min_aln", "secondary_variant_selected",
+                    "near_tie", "low_taxonomic_support", "missing_in"):
+            n = sum(v for k, v in flag_counts.items() if k.startswith(key))
+            if n:
+                review.append(f"{n} {key}")
+        self.statusUpdated.emit(
+            "review",
+            "Review      │ " + (" · ".join(review) if review else "nothing flagged")
+            + ("  (see the Flag column)" if review else ""))
 
         # ── Run log ──
         log_lines = [
@@ -2200,7 +2830,7 @@ class _BestSeqWorker(QtCore.QThread):
             f"Status     : {status_str}",
             f"Total time : {elapsed_str}",
             "",
-            "Input comparisons (FASTA + BLAST table):",
+            "Input runs (FASTA + BLAST table):",
         ]
         for pair in self.pairs:
             log_lines.append(f"  {os.path.abspath(pair['fasta'])}")
@@ -2218,6 +2848,8 @@ class _BestSeqWorker(QtCore.QThread):
             *ref_lines,
             *(["", "  Repeated FASTA headers (only the first record of each was used):"]
               + dup_lines if dup_lines else []),
+            *(["", "  FASTA headers missing from the BLAST table (those got no hits):"]
+              + nomatch_lines if nomatch_lines else []),
             "",
             "Scoring:",
             "  score = taxonomic bonus of the best concordant hit",
@@ -2225,13 +2857,28 @@ class _BestSeqWorker(QtCore.QThread):
             f"        + {bit_weight:g} x (bit score of that hit, normalised within the sample)",
             f"        - {amb_penalty:g} x ambs  -  {gap_penalty:g} x estgaps",
             "  Ties are broken by longer sequence, then more reads, then file name.",
+            "  A secondary variant replaces the barcode only if its top hit reaches a",
+            "  deeper taxonomic level than the barcode's top hit.",
             "",
             "Results:",
             f"  Samples                  : {n_samples}",
             (f"  Sequences classified     : {n_single}" if n_files == 1 else
              f"  Identical across runs    : {n_identical}"),
             *([] if n_files == 1 else
-              [f"  Resolved by score        : {n_selected}"]),
+              [f"  Found in one run only    : {n_one_run}",
+               f"  Resolved by score        : {n_selected}"]),
+            "",
+            f"  Variants overruled       : {n_variant_overruled}"
+            "  (won on score, same taxonomic level as the barcode)",
+            "",
+            "  Classification of the selected sequences:",
+            f"    identified          : {n_written['identified']}",
+            f"    no BLAST hit        : {n_written['no_blast_hit']}"
+            f"  (no hit at all: {n_written['no_blast_hit'] - n_written['below_min_aln']}"
+            f" · only hits below the minimum alignment: {n_written['below_min_aln']})",
+            f"    taxonomic mismatch  : {n_written['tax_mismatch']}"
+            + (f"  (of which {n_written['no_query_tax']} without expected taxonomy:"
+               f" flag no_query_taxonomy)" if n_written["no_query_tax"] else ""),
             "",
             "  Taxonomic level reached by the selected sequence:",
         ]
@@ -2252,17 +2899,24 @@ class _BestSeqWorker(QtCore.QThread):
             f"  Folder                   : {output_dir}",
             f"  Report TSV               : {os.path.basename(tsv_path)}",
             f"  Report XLSX              : {os.path.basename(xlsx_path) if xlsx_path else 'N/A'}",
-            f"  All best sequences       : {os.path.basename(fa_all)}  ({n_written['all']} seqs)",
-            f"  Taxonomically identified : {os.path.basename(fa_id)}  ({n_written['identified']} seqs)",
-            f"  Without taxonomic hit    : {os.path.basename(fa_noid)}  ({n_written['no_tax']} seqs)",
+            f"  All best sequences       : {_fa_line(fa_all, 'all')}",
+            f"  Taxonomically identified : {_fa_line(fa_id, 'identified')}",
+            f"  No BLAST hit             : {_fa_line(fa_nohit, 'no_blast_hit')}",
+            f"  Taxonomic mismatch       : {_fa_line(fa_mism, 'tax_mismatch')}",
             "",
-            "NOTE: the two subsets split strictly on taxonomic concordance and together",
-            "      add up to the '_all' file. '_identified' holds only the sequences whose",
-            "      best hit matched the expected taxonomy at some rank; '_no_tax_hit' holds",
-            "      the rest. A sequence identical in every run is a reproducible consensus,",
-            "      not a verified identification: without a taxonomic hit it goes to",
-            "      '_no_tax_hit' like any other. Use the 'Decision' column of the report to",
-            "      tell those apart from the ones that also disagreed between runs.",
+            "NOTE: the subsets split strictly on taxonomic concordance and together add",
+            "      up to the '_all' file. '_identified' holds the sequences whose best hit",
+            "      matched the expected taxonomy at some rank. '_no_blast_hit' holds those",
+            "      for which BLAST found nothing similar in the database (no hit, or only",
+            "      short local hits below the minimum alignment): an unknown or poorly",
+            "      represented taxon, or a non-target / low-quality sequence.",
+            "      '_tax_mismatch' holds those with good hits of another taxon, and those",
+            "      with hits but no expected taxonomy to compare with (flag",
+            "      no_query_taxonomy: complete the reference). A sequence",
+            "      identical in every run is a reproducible consensus, not a verified",
+            "      identification: without a taxonomic hit it is split like any other.",
+            "      Use the 'Decision' column of the report to tell those apart from the",
+            "      ones that also disagreed between runs.",
             "",
             "      Review 'tax_mismatch' first: those samples have good BLAST hits that",
             "      contradict the expected taxonomy, which is what a contamination, an",

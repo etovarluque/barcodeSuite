@@ -9,7 +9,7 @@ from .shared import _get_base_dir, _tr
 from .fasta_tools import _DragDropLineEdit
 from .best_seq_panel import (
     read_tax_reference, QUERY_TAX_COLUMNS, sample_id_of, lookup_tax,
-    concordance_level, display_taxon,
+    concordance_level, display_taxon, _cached, reference_format_warning,
 )
 from .blast_panel import _ReferenceFileGroup
 
@@ -243,9 +243,11 @@ class _BoldFormatWorker(QtCore.QThread):
     def _add_query_tax(cls, out_headers, records, ref, ref_lower, suffix):
         """Append Query_* reference taxonomy and Tax_level_match to every row.
 
-        Returns (out_headers, records, n_filled, unknown_sample_ids). The hit
-        taxonomy is read from BOLD's Order/Family/Genus/Species columns; the
-        comparison rule is the same one the BLAST panel uses.
+        Returns (out_headers, records, n_filled, unknown_sample_ids,
+        empty_sample_ids, can_match): empty_sample_ids are in the reference
+        but with all four taxonomy cells empty, so their hits cannot be judged.
+        The hit taxonomy is read from BOLD's Order/Family/Genus/Species
+        columns; the comparison rule is the same one the BLAST panel uses.
         """
         q_i = out_headers.index(cls.QUERY_COL_NAME)
         hit_idx = [out_headers.index(h) if h in out_headers else None
@@ -257,6 +259,7 @@ class _BoldFormatWorker(QtCore.QThread):
 
         cache = {}
         unknown = set()
+        empty = set()
         n_filled = 0
         new_records = []
         for values, rank, gi, first in records:
@@ -267,6 +270,8 @@ class _BoldFormatWorker(QtCore.QThread):
                 if tax is None:
                     unknown.add(sample)
                     tax = ("", "", "", "")
+                elif not any(tax):
+                    empty.add(sample)
                 cache[query] = tax
             tax = cache[query]
             if any(tax):
@@ -278,7 +283,7 @@ class _BoldFormatWorker(QtCore.QThread):
                        for k, i in zip(cls.TAX_RANK_KEYS, hit_idx)}
                 row.append(concordance_level(hit, qtax))
             new_records.append((row, rank, gi, first))
-        return new_headers, new_records, n_filled, sorted(unknown), can_match
+        return new_headers, new_records, n_filled, sorted(unknown), sorted(empty), can_match
 
     @classmethod
     def _write(cls, out_headers, records, out_path):
@@ -354,6 +359,9 @@ class _BoldFormatWorker(QtCore.QThread):
             if self._ref_path:
                 _id_col, _tax_cols, ref = read_tax_reference(self._ref_path)
                 ref_lower = {k.lower(): v for k, v in ref.items()}
+                fmt_warn = reference_format_warning(ref)
+                if fmt_warn:
+                    self.log_line.emit(f"⚠ {fmt_warn}")
             for i, path in enumerate(self._files, 1):
                 if self._stop:
                     return
@@ -366,10 +374,10 @@ class _BoldFormatWorker(QtCore.QThread):
                         headers, groups, q_idx, id_idx, self._max_hits)
                     tax_info = None
                     if ref is not None:
-                        out_headers, records, n_fill, unknown, can_match = \
+                        out_headers, records, n_fill, unknown, empty, can_match = \
                             self._add_query_tax(out_headers, records, ref,
                                                 ref_lower, self._suffix)
-                        tax_info = (n_fill, unknown, can_match)
+                        tax_info = (n_fill, unknown, empty, can_match)
                     out_path = os.path.join(
                         self._out_dir,
                         f"{os.path.splitext(name)[0]}_formatted.xlsx")
@@ -382,13 +390,15 @@ class _BoldFormatWorker(QtCore.QThread):
                         f"{len(records)} row(s) (hits/group: {kept}) "
                         f"→ {os.path.basename(out_path)}")
                     if tax_info:
-                        n_fill, unknown, can_match = tax_info
+                        n_fill, unknown, empty, can_match = tax_info
                         self.log_line.emit(
                             f"  Query taxonomy filled in {n_fill}/{len(records)} row(s)")
-                        if unknown:
-                            shown = ", ".join(unknown[:10]) + (" …" if len(unknown) > 10 else "")
-                            self.log_line.emit(
-                                f"  ⚠ {len(unknown)} sample ID(s) not in the reference: {shown}")
+                        for ids, what in ((unknown, "not in the reference"),
+                                          (empty, "in the reference with empty taxonomy")):
+                            if ids:
+                                shown = ", ".join(ids[:10]) + (" …" if len(ids) > 10 else "")
+                                self.log_line.emit(
+                                    f"  ⚠ {len(ids)} sample ID(s) {what}: {shown}")
                         if not can_match:
                             self.log_line.emit(
                                 "  ⚠ Tax_level_match skipped: the BOLD table lacks "
@@ -474,7 +484,11 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         self._layout.addLayout(file_row)
 
         # ── Options ──
-        self._layout.addWidget(self._make_section_lbl("Options"))
+        opt_box = QtWidgets.QGroupBox("Options")
+        opt_box.setStyleSheet(group_box_style())
+        opt_layout = QtWidgets.QVBoxLayout(opt_box)
+        opt_layout.setContentsMargins(16, 16, 16, 16)
+        opt_layout.setSpacing(10)
 
         hits_row = QtWidgets.QHBoxLayout()
         hits_row.setSpacing(12)
@@ -486,12 +500,12 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         self._hits_spin.setFixedWidth(90)
         hits_row.addWidget(self._hits_spin)
         hits_row.addStretch()
-        self._layout.addLayout(hits_row)
+        opt_layout.addLayout(hits_row)
 
         self._keep_all_chk = QtWidgets.QCheckBox("Keep all hits (ignore the limit above)")
         self._keep_all_chk.toggled.connect(
             lambda on: (self._hits_spin.setDisabled(on), lbl_hits.setDisabled(on)))
-        self._layout.addWidget(self._keep_all_chk)
+        opt_layout.addWidget(self._keep_all_chk)
 
         # ── Optional query-taxonomy reference file (same control as BLAST) ──
         self._ref_group = _ReferenceFileGroup()
@@ -499,7 +513,9 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         ref_form = QtWidgets.QFormLayout()
         ref_form.setContentsMargins(0, 0, 0, 0)
         self._ref_group.add_to(ref_form)
-        self._layout.addLayout(ref_form)
+        self._ref_group.set_names_provider(self._query_ids)
+        opt_layout.addLayout(ref_form)
+        self._layout.addWidget(opt_box)
 
         # ── Status + progress ──
         self._status_lbl = make_label("", color=TEXT_SEC)
@@ -552,7 +568,7 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         self._clear_btn.clicked.connect(self._clear)
         fl.addWidget(self._clear_btn)
 
-        self._open_folder_btn = QtWidgets.QPushButton("Open folder  📂")
+        self._open_folder_btn = QtWidgets.QPushButton("Open folder")
         self._open_folder_btn.setObjectName("secondary_btn")
         self._open_folder_btn.setFixedHeight(44)
         self._open_folder_btn.hide()
@@ -624,7 +640,24 @@ class BoldFormatterPanel(QtWidgets.QWidget):
         if path:
             self._file_edit.setText(path)
 
+    def _query_ids(self) -> list:
+        """Query IDs of the BOLD table, for the reference match check."""
+        path = self._file_edit.text().strip()
+        if not path or not os.path.isfile(path):
+            return []
+
+        def load(p):
+            headers, data = _BoldFormatWorker._load_rows(p)
+            q = headers.index(_BoldFormatWorker.QUERY_COL_NAME)
+            return [str(r[q]).strip() for _n, r in data
+                    if r[q] is not None and str(r[q]).strip()]
+        try:
+            return _cached(path, "boldq", load)
+        except Exception:
+            return []
+
     def _on_file_changed(self, text: str):
+        self._ref_group.refresh_check()
         self._set_run_enabled(bool(text.strip()))
         self._status_lbl.setText("")
         self._status_lbl.setStyleSheet("")

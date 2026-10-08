@@ -108,6 +108,11 @@ TEXT_HINT = "#A09D96"
 SIDEBAR_BG = "#EDEDED"
 TOPBAR_BG = "#2A2D3A"
 GRAY_DARK = "#203864"
+# A drop target with a file held over it: grey fill, blue dashed line (the look
+# of the main drop zones, `#drop_zone[dragging="true"]`). Every other drop
+# target uses these two, so the feedback is the same wherever a file is dropped.
+DROP_DRAG_BG = "#EBEBEA"
+DROP_DRAG_BORDER = f"2px dashed {BLUE_MID}"
 
 STYLESHEET = f"""
 QWidget {{
@@ -451,6 +456,17 @@ QDialog QDialogButtonBox QPushButton[default="true"]:hover {{
 # ═══════════════════════════════════════════════════════════════════════════
 # UTILITIES
 # ═══════════════════════════════════════════════════════════════════════════
+
+def group_box_style(titled: bool = True) -> str:
+    """Style of the settings boxes of every panel: thin border, rounded
+    corners and the title set into the top border."""
+    return (
+        f"QGroupBox {{ font-weight:600; color:#1A1A2E; border:1px solid {GRAY_LINE};"
+        f" border-radius:10px; margin-top:{'12px' if titled else '0px'}; }}"
+        "QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left;"
+        " left:14px; padding:0 6px; }"
+    )
+
 
 def make_label(text, size=19, bold=False, color=TEXT_PRI):
     lbl = QtWidgets.QLabel(text)

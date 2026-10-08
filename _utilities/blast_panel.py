@@ -1,6 +1,8 @@
 from __future__ import annotations
 import os
+import re
 import csv
+import json
 import time
 import datetime
 import threading
@@ -11,6 +13,10 @@ from .shared import _get_base_dir, _profiles_dir, _tr, _json_mod
 from .best_seq_panel import (
     _RefDropZone, read_tax_reference, QUERY_TAX_COLUMNS,
     sample_id_of, lookup_tax, concordance_level, display_taxon,
+    read_tax_reference_cached, reference_match_check, fasta_headers,
+    table_column, _cached, reference_format_warning, reference_report_lines,
+    reference_empty_ids, BLAST_RESULTS_SHEET, repeated_headers, repeated_note,
+    
 )
 
 
@@ -203,14 +209,48 @@ def apply_reference_and_tax_match(tsv_path: str, ref: dict, ref_lower: dict,
     return n_rows, n_filled, sorted(unknown), (n_match if has_subject_tax else -1)
 
 
+# Hit_rank and the BLAST metric columns (P_identity … Bit_score) are
+# numeric. Writing them as strings makes Excel flag every cell with
+# "Number stored as text", whose background error-checker re-scans the
+# sheet on every sort/filter/scroll → high CPU. Convert these to
+# int/float so openpyxl writes native numeric cells; the rest stay text.
+# Detect them by header name so it is robust to column shifts.
+_NUMERIC_NAMES = frozenset({
+    "Hit_rank", "P_identity", "Alignment_length", "Num_mismatches",
+    "Gap_opens", "Query_start", "Query_end", "Subject_start",
+    "Subject_end", "Evalue", "Bit_score",
+})
+
+
+def _num(v):
+    if v == "":
+        return v
+    try:
+        return int(v)
+    except ValueError:
+        pass
+    try:
+        return float(v)   # handles decimals and e-notation (Evalue)
+    except ValueError:
+        return v          # leave genuinely non-numeric text as-is
+
+
 class _XlsxBuildError(Exception):
     """openpyxl missing, or the TSV could not be read — not the write itself."""
 
 
-def build_xlsx_from_tsv(tsv_path: str) -> str:
+def build_xlsx_from_tsv(tsv_path: str, run_info: Optional[dict] = None,
+                        params_override: Optional[dict] = None) -> str:
     """Convert *tsv_path* to a formatted .xlsx next to it, overwriting any
     existing file of that name (e.g. from an earlier run, or before the
     reference/Tax_level_match columns were updated by _ApplyReferenceDialog).
+
+    Besides the hit table ("BLAST Results") the workbook gets a "Summary"
+    sheet and a "Best hit" sheet (see _add_summary_sheets). *run_info*
+    describes the run (input files, parameters, ...); when None it is read
+    from the run's state file next to the table, if there is one.
+    *params_override* replaces some of its parameters (e.g. the reference
+    file just applied by _ApplyReferenceDialog).
 
     Module-level (rather than a _BlastWorker method) so both the worker and
     _ApplyReferenceDialog — which runs on the UI thread with no worker
@@ -262,31 +302,8 @@ def build_xlsx_from_tsv(tsv_path: str) -> str:
     # new sample block so the hit groups are visually separated.
     border_group_top = Border(left=thin, right=thin, top=medium, bottom=thin)
 
-    # Hit_rank and the BLAST metric columns (P_identity … Bit_score) are
-    # numeric. Writing them as strings makes Excel flag every cell with
-    # "Number stored as text", whose background error-checker re-scans the
-    # sheet on every sort/filter/scroll → high CPU. Convert these to
-    # int/float so openpyxl writes native numeric cells; the rest stay text.
-    # Detect them by header name so it is robust to column shifts.
-    _NUMERIC_NAMES = frozenset({
-        "Hit_rank", "P_identity", "Alignment_length", "Num_mismatches",
-        "Gap_opens", "Query_start", "Query_end", "Subject_start",
-        "Subject_end", "Evalue", "Bit_score",
-    })
     _numeric_idx = frozenset(
         i for i, h in enumerate(headers) if h in _NUMERIC_NAMES)
-
-    def _num(v):
-        if v == "":
-            return v
-        try:
-            return int(v)
-        except ValueError:
-            pass
-        try:
-            return float(v)   # handles decimals and e-notation (Evalue)
-        except ValueError:
-            return v          # leave genuinely non-numeric text as-is
 
     def _hfill(ci):
         return H1 if ci <= 1 else (H2 if ci <= 12 else H3)
@@ -298,7 +315,7 @@ def build_xlsx_from_tsv(tsv_path: str) -> str:
 
     wb = Workbook()
     ws = wb.active
-    ws.title = "BLAST Results"
+    ws.title = BLAST_RESULTS_SHEET
 
     # Header row
     ws.append(headers)
@@ -367,9 +384,572 @@ def build_xlsx_from_tsv(tsv_path: str) -> str:
         width = max((len(str(c.value or "")) for c in col_cells), default=8)
         ws.column_dimensions[get_column_letter(ci + 1)].width = min(width + 2, 55)
 
+    if run_info is None:
+        run_info = load_run_info(tsv_path)
+    if params_override:
+        run_info = dict(run_info)
+        run_info["params"] = {**(run_info.get("params") or {}), **params_override}
+    rows = [(line.split("\t") + [""] * n_cols)[:n_cols] for line in lines[1:]]
+    _add_summary_sheets(wb, headers, rows, tsv_path, run_info)
+
     xlsx_path = tsv_path.rsplit(".", 1)[0] + ".xlsx"
     wb.save(xlsx_path)   # overwrites any existing file of that name
     return xlsx_path
+
+
+# ── Summary and Best hit sheets ─────────────────────────────────────────────
+
+# How far each query was identified, deepest first. The four ranks and "none"
+# are Tax_level_match values (best hit vs. the reference taxonomy); the rest
+# describe queries without a usable comparison.
+_ID_LABELS = {
+    "organism":     "Species (organism)",
+    "genus":        "Genus",
+    "family":       "Family",
+    "order":        "Order",
+    "none":         "No match with the reference (none)",
+    "no_reference": "Sample not in the reference",
+    "blast_hit":    "With BLAST hits",       # no reference applied to the table
+    "no_hit":       "No BLAST hit",
+    "not_searched": "Not searched (run incomplete)",
+}
+_RANK_SCORE = {"organism": 4, "genus": 3, "family": 2, "order": 1}
+_ID_FILL = {
+    "organism": "FFC6EFCE", "genus": "FFE2F0D9", "family": "FFFFF2CC",
+    "order": "FFFCE4D6", "none": "FFF8CBAD", "no_reference": "FFEDEDED",
+    "no_hit": "FFD9D9D9", "not_searched": "FFD9D9D9",
+}
+# Header colours of the Best hit sheet, by column name: the query block
+# (navy), taxonomy (burnt orange) and, for everything else, BLAST metrics (teal).
+_ID_ZONE_COLS = frozenset(("Identification", "Hits", "Hit_rank", "Query_name"))
+_TAX_ZONE_COLS = frozenset(
+    ("Subject_Kingdom", "Subject_Class", "Tax_level_match")
+    + _SUBJECT_TAX_COLUMNS + tuple(QUERY_TAX_COLUMNS))
+
+
+def load_run_info(tsv_path: str) -> dict:
+    """What the Summary sheet needs to know about the run that produced
+    *tsv_path*, read from its blast-<run_id>.state.json (input files,
+    parameters, sequences searched). {} when there is no state file, e.g. a
+    table from the BLAST Results File tab: the summary then describes the
+    table alone."""
+    base = os.path.splitext(tsv_path)[0]
+    try:
+        with open(base + ".state.json", encoding="utf-8") as fh:
+            st = json.load(fh)
+    except Exception:
+        return {}
+    if st.get("kind") == "hit_table":
+        # Written by the BLAST Results File tab (see save_hit_table_info).
+        return {"kind": "hit_table", "params": st.get("params") or {},
+                "inputs": [(f, qs) for f, qs in st.get("inputs") or []]}
+    fasta = base + ".fa"
+    return {"kind": "search", "run_id": st.get("run_id", ""),
+            "files": st.get("files") or [], "params": st.get("params") or {},
+            "processed": st.get("processed"), "status": st.get("status", ""),
+            "sessions": st.get("sessions") or [],
+            "fasta": fasta if os.path.isfile(fasta) else ""}
+
+
+def save_hit_table_info(tsv_path: str, inputs: list, params: dict):
+    """Keep what the Summary sheet says about a table built from NCBI Hit Table
+    files (the files and the queries of each, the settings) beside it, so the
+    sheet can be rebuilt when a reference is applied later. Never raises: this
+    only feeds the Summary."""
+    info = {"kind": "hit_table", "params": params,
+            "inputs": [[f, list(qs)] for f, qs in inputs]}
+    try:
+        with open(os.path.splitext(tsv_path)[0] + ".state.json", "w", encoding="utf-8") as fh:
+            json.dump(info, fh)
+    except Exception:
+        pass
+
+
+def _fasta_query_names(path: str) -> Optional[List[str]]:
+    """Query_name of every record of a FASTA as a BLAST run writes it (the
+    header without '>', spaces as '_'; see _to_single_line_fasta), or None if
+    the file cannot be read."""
+    if not path:
+        return None
+    try:
+        opener = __import__("gzip").open if path.lower().endswith(".gz") else open
+        with opener(path, "rt", encoding="utf-8", errors="replace") as fh:
+            return [ln.strip().replace(" ", "_")[1:]
+                    for ln in fh if ln.lstrip().startswith(">")]
+    except Exception:
+        return None
+
+
+def _to_float(v) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def pick_best_hits(headers: List[str], rows: List[list]) -> Dict[str, tuple]:
+    """Best hit of every query of a hit table: {Query_name: (row, n_hits)}.
+
+    The best hit is the one that agrees with the reference taxonomy at the
+    deepest rank (Tax_level_match), which is not necessarily BLAST's first.
+    Hits at the same rank (and every hit when no reference was applied, or
+    when none agrees, "none") are ordered by bit score, then identity, then
+    fewest gap openings and mismatches, then BLAST's own order. The query's
+    own ambiguities are the same for all of its hits, so they cannot
+    separate them.
+    """
+    col = {h: i for i, h in enumerate(headers)}
+
+    def get(r, name):
+        i = col.get(name)
+        return r[i] if i is not None and i < len(r) else ""
+
+    groups: Dict[str, list] = {}
+    for r in rows:
+        q = str(get(r, "Query_name")).strip()
+        if q:
+            groups.setdefault(q, []).append(r)
+
+    def key(r):
+        return (_RANK_SCORE.get(str(get(r, "Tax_level_match")).strip(), 0),
+                _to_float(get(r, "Bit_score")), _to_float(get(r, "P_identity")),
+                -_to_float(get(r, "Gap_opens")), -_to_float(get(r, "Num_mismatches")),
+                -_to_float(get(r, "Hit_rank")))
+
+    return {q: (max(hits, key=key), len(hits)) for q, hits in groups.items()}
+
+
+def _identification(row: list, col: dict, has_match: bool) -> str:
+    """Identification category of a query, from its best hit row."""
+    if not has_match:
+        return "blast_hit"
+    if not any(display_taxon(row[col[c]]) for c in QUERY_TAX_COLUMNS if c in col):
+        return "no_reference"
+    level = str(row[col["Tax_level_match"]]).strip()
+    return level if level in _RANK_SCORE else "none"
+
+
+def refresh_summary_sheets(wb, path: str, params_override: Optional[dict] = None) -> bool:
+    """Rebuild the Summary and Best hit sheets of a BLAST results workbook
+    already open in *wb* (saved at *path*) from its hit table, e.g. after the
+    table was edited in place by Best Sequence's reference step. Does nothing
+    and returns False when the workbook has neither sheet (not a BLAST panel
+    workbook, or one made before they existed)."""
+    if not ({"Summary", "Best hit"} & set(wb.sheetnames)):
+        return False
+    from .best_seq_panel import blast_sheet
+    sheet = blast_sheet(wb)
+    values = [["" if v is None else str(v) for v in r]
+              for r in sheet.iter_rows(values_only=True)]
+    values = [r for r in values if any(v.strip() for v in r)]
+    for name in ("Summary", "Best hit"):
+        if name in wb.sheetnames:
+            del wb[name]
+    if not values:
+        return False
+    headers = [h.strip() for h in values[0]]
+    n_cols = len(headers)
+    rows = [(r + [""] * n_cols)[:n_cols] for r in values[1:]]
+    run_info = load_run_info(path)
+    if params_override:
+        run_info["params"] = {**(run_info.get("params") or {}), **params_override}
+    _add_summary_sheets(wb, headers, rows, path, run_info)
+    return True
+
+
+_BAR_WIDTH = 50
+
+
+def _text_bar(frac: float, width: int = _BAR_WIDTH) -> str:
+    """Bar of whole block characters, `width` characters = 100 % (2 % per
+    character). Text, not an Excel data bar, so it looks the same in every
+    Excel version and in LibreOffice; the exact value sits beside it. A
+    non-zero value always shows at least one block."""
+    if frac <= 0:
+        return ""
+    return "█" * max(1, min(width, int(round(frac * width))))
+
+
+def _file_labels(paths: List[str]) -> List[str]:
+    """Short, distinct labels for input files: the file name, plus the first
+    folder that tells equally named files apart ("Lote_1 · name.fasta")."""
+    names = [os.path.basename(p) for p in paths]
+    if len(set(names)) == len(names):
+        return names
+    dirs = [os.path.dirname(os.path.abspath(p)).replace("\\", "/").split("/") for p in paths]
+    common = 0
+    while all(len(d) > common for d in dirs) and len({d[common] for d in dirs}) == 1:
+        common += 1
+    labels = [f"{d[common]} · {n}" if len(d) > common else n for d, n in zip(dirs, names)]
+    if len(set(labels)) == len(labels):
+        return labels
+    return [f"{'/'.join(d[common:])}/{n}" for d, n in zip(dirs, names)]
+
+
+def _add_summary_sheets(wb, headers: List[str], rows: List[list], tsv_path: str,
+                        run_info: dict):
+    """Add the "Summary" (first, shown on opening) and "Best hit" sheets
+    ahead of the hit table, in the hit table's style."""
+    from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+
+    thin = Side(style="thin", color="FFCCCCCC")
+    st = {
+        "H1": PatternFill(patternType="solid", fgColor="FF1A365D"),   # navy
+        "H2": PatternFill(patternType="solid", fgColor="FF0D5E6E"),   # teal
+        "H3": PatternFill(patternType="solid", fgColor="FF7C3200"),   # burnt orange
+        "white_bold": Font(color="FFFFFFFF", bold=True, size=10),
+        "normal_font": Font(size=10),
+        "bold_font": Font(size=10, bold=True),
+        "hdr_align": Alignment(horizontal="center", vertical="center"),
+        "dat_align": Alignment(vertical="center", wrap_text=False),
+        "border": Border(left=thin, right=thin, top=thin, bottom=thin),
+    }
+
+    col = {h: i for i, h in enumerate(headers)}
+    has_match = "Tax_level_match" in col
+    best = pick_best_hits(headers, rows)
+    kind = run_info.get("kind", "")
+    unit = "Queries" if kind == "hit_table" else "Sequences"
+
+    # ── Input files and the queries each one holds ──
+    inputs = run_info.get("inputs")          # [(path, [Query_name] | None)]
+    if inputs is None:
+        inputs = [(f, _fasta_query_names(f)) for f in run_info.get("files") or []]
+
+    # Every query of the run: those of the FASTA actually searched (so the
+    # sequences without hits count too), else those of the input files, plus
+    # any in the table.
+    all_q = set(best)
+    fa_q = _fasta_query_names(run_info.get("fasta", ""))
+    if fa_q:
+        all_q.update(fa_q)
+    else:
+        for _f, qs in inputs:
+            all_q.update(qs or [])
+    processed = run_info.get("processed")
+    processed = set(processed) if processed is not None else None
+
+    cats: Dict[str, str] = {}
+    for q in all_q:
+        if q in best:
+            cats[q] = _identification(best[q][0], col, has_match)
+        elif processed is not None and q not in processed:
+            cats[q] = "not_searched"
+        else:
+            cats[q] = "no_hit"
+
+    if has_match:
+        levels = ["organism", "genus", "family", "order", "none", "no_reference",
+                  "no_hit", "not_searched"]
+    else:
+        levels = ["blast_hit", "no_hit", "not_searched"]
+    counts = {lv: sum(1 for c in cats.values() if c == lv) for lv in levels}
+    levels = [lv for lv in levels
+              if counts[lv] or lv not in ("no_reference", "not_searched")]
+    n_total = len(all_q)
+
+    def fill(argb):
+        return PatternFill(patternType="solid", fgColor=argb)
+
+    # ── Best hit: one row per query ──
+    wsb = wb.create_sheet("Best hit", 0)
+    b_headers = ["Identification", "Hits"] + headers
+    wsb.append(b_headers)
+    for ci, name in enumerate(b_headers, 1):
+        cell = wsb.cell(row=1, column=ci)
+        cell.fill = (st["H1"] if name in _ID_ZONE_COLS
+                     else st["H3"] if name in _TAX_ZONE_COLS else st["H2"])
+        cell.font, cell.alignment, cell.border = st["white_bold"], st["hdr_align"], st["border"]
+    wsb.row_dimensions[1].height = 22
+    q_i = col.get("Query_name")
+    for rn, q in enumerate(sorted(all_q), start=2):
+        cat = cats[q]
+        if q in best:
+            row, n_hits = best[q]
+            vals = [_num(v) if headers[ci] in _NUMERIC_NAMES else v
+                    for ci, v in enumerate(row)]
+        else:
+            n_hits = 0
+            vals = [""] * len(headers)
+            if q_i is not None:
+                vals[q_i] = q
+        wsb.append([cat, n_hits] + vals)
+        for ci in range(1, len(b_headers) + 1):
+            cell = wsb.cell(row=rn, column=ci)
+            cell.font, cell.alignment, cell.border = st["normal_font"], st["dat_align"], st["border"]
+        if cat in _ID_FILL:
+            wsb.cell(row=rn, column=1).fill = fill(_ID_FILL[cat])
+    wsb.freeze_panes = "C2"
+    wsb.auto_filter.ref = wsb.dimensions
+    for ci, col_cells in enumerate(wsb.columns, 1):
+        width = max((len(str(c.value)) for c in col_cells if c.value is not None), default=8)
+        wsb.column_dimensions[get_column_letter(ci)].width = min(width + 2, 55)
+
+    # ── Summary ──
+    from openpyxl.chart import BarChart, Reference
+    ws = wb.create_sheet("Summary", 0)
+    ws.sheet_view.showGridLines = False
+    title_font = Font(size=16, bold=True, color="FF1A365D")
+    note_font = Font(size=9, italic=True, color="FF666666")
+    path_font = Font(size=9, color="FF595959")
+    bar_font = Font(name="Consolas", size=10, color="FF5B9BD5")
+    grey = PatternFill(patternType="solid", fgColor="FFF2F2F2")
+    card_side = Side(style="thin", color="FFBFBFBF")
+    NC = 6                                   # columns A:F
+    ws.column_dimensions["A"].width = 38
+    for letter in "BCDEF":
+        ws.column_dimensions[letter].width = 17
+    r = [1]   # next row to write
+
+    def put(values, font=None, cell_fill=None, pct_from=None):
+        for ci, v in enumerate(values, 1):
+            cell = ws.cell(row=r[0], column=ci, value=v)
+            cell.font = font or st["normal_font"]
+            if cell_fill:
+                cell.fill = cell_fill
+            if isinstance(v, float) and pct_from and ci >= pct_from:
+                cell.number_format = "0.0%"
+            elif isinstance(v, int) and ci > 1:
+                cell.number_format = "#,##0"
+        r[0] += 1
+
+    def section(title, columns=()):
+        r[0] += 1
+        vals = ([title] + list(columns) + [""] * NC)[:NC]
+        put(vals, font=st["white_bold"], cell_fill=st["H1"])
+        row = r[0] - 1
+        lines = 1
+        for ci in range(2, NC + 1):
+            c = ws.cell(row=row, column=ci)
+            c.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            if c.value:
+                lines = max(lines, -(-len(str(c.value)) // 15))
+        if lines > 1:
+            ws.row_dimensions[row].height = 14 * lines + 4
+
+    def wide(text, font, height=None, first_col=1):
+        """Text across first_col:F, wrapped."""
+        ws.cell(row=r[0], column=first_col, value=text).font = font
+        ws.merge_cells(start_row=r[0], start_column=first_col, end_row=r[0], end_column=NC)
+        ws.cell(row=r[0], column=first_col).alignment = Alignment(wrap_text=True, vertical="top")
+        if height:
+            ws.row_dimensions[r[0]].height = height
+        r[0] += 1
+
+    def total_row(values, pct_col=None):
+        put(values, font=st["bold_font"], pct_from=pct_col)
+        for ci in range(1, NC + 1):
+            ws.cell(row=r[0] - 1, column=ci).border = Border(top=Side(style="thin", color="FF000000"))
+
+    def bar_cell(frac):
+        c = ws.cell(row=r[0] - 1, column=4, value=_text_bar(frac))
+        c.font = bar_font
+        c.alignment = Alignment(horizontal="left", vertical="center")
+        ws.merge_cells(start_row=r[0] - 1, start_column=4, end_row=r[0] - 1, end_column=NC)
+
+    # ── Title and one-line description of the run ──
+    put([f"BLAST results summary"], font=title_font)
+    params = run_info.get("params") or {}
+    bits = [os.path.basename(tsv_path)]
+    if run_info.get("run_id"):
+        bits.append(f"run {run_info['run_id']}")
+    if run_info.get("status"):
+        bits.append(run_info["status"])
+    bits.append(datetime.datetime.now().strftime("%Y-%m-%d %H:%M"))
+    if kind != "hit_table" and params.get("database"):
+        bits.append(str(params["database"]))
+        bits.append(str(params.get("program", "")).split("&")[0])
+    if params.get("nhits"):
+        bits.append(f"{params['nhits']} hits per {unit[:-1].lower()}")
+    if kind != "hit_table" and params.get("nseq"):
+        bits.append(f"{params['nseq']} seq/batch")
+    bits.append("taxonomy fetched" if params.get("fetch_taxonomy", True) else "no taxonomy")
+    wide(" · ".join(b for b in bits if b), note_font, 28)
+
+    # ── Key figures (cards) ──
+    pident = col.get("P_identity")
+    low_ident = sum(1 for row, _n in best.values()
+                    if pident is not None and 0 < _to_float(row[pident]) < 97.0)
+    not_first = (sum(1 for row, _n in best.values()
+                     if str(row[col["Hit_rank"]]).strip() not in ("", "1"))
+                 if has_match and "Hit_rank" in col else None)
+    cards = [(unit.upper(), n_total, "FF1A365D"),
+             ("WITH HITS", len(best), "FF2E7D32"),
+             ("NO BLAST HIT", counts.get("no_hit", 0), "FF757575"),
+             ("HIT ROWS", len(rows), "FF1A365D")]
+    if not_first is not None:
+        cards.append(("BEST ≠ 1st HIT", not_first, "FFB45309"))
+    elif counts.get("not_searched"):
+        cards.append(("NOT SEARCHED", counts["not_searched"], "FFB45309"))
+    r[0] += 1
+    lab_row, val_row = r[0], r[0] + 1
+    for j, (lab, val, color) in enumerate(cards):       # from column A, like the tables
+        c1 = ws.cell(row=lab_row, column=1 + j, value=lab)
+        c1.font = Font(size=8, color="FF595959")
+        c1.alignment = Alignment(horizontal="center", vertical="center")
+        c1.fill = grey
+        c1.border = Border(top=card_side, left=card_side, right=card_side)
+        c2 = ws.cell(row=val_row, column=1 + j, value=val)
+        c2.font = Font(size=18, bold=True, color=color)
+        c2.alignment = Alignment(horizontal="center", vertical="center")
+        c2.number_format = "#,##0"
+        c2.fill = grey
+        c2.border = Border(bottom=card_side, left=card_side, right=card_side)
+    ws.row_dimensions[lab_row].height = 16
+    ws.row_dimensions[val_row].height = 32
+    r[0] = val_row + 1
+
+    # ── Identification level ──
+    section("Identification level", [unit, "%", "Share of the total"])
+    for lv in levels:
+        n = counts[lv]
+        pct = n / n_total if n_total else 0.0
+        put([_ID_LABELS[lv], n, float(pct)], pct_from=3)
+        bar_cell(pct)
+        if lv in _ID_FILL:
+            ws.cell(row=r[0] - 1, column=1).fill = fill(_ID_FILL[lv])
+    total_row(["Total", n_total, 1.0 if n_total else 0.0], pct_col=3)
+    if has_match:
+        wide("Rank at which each query's best hit agrees with the reference taxonomy "
+             "(Tax_level_match). Best hit = deepest rank agreeing with the reference; "
+             "ties and 'none' by bit score, identity, fewest gaps and mismatches.",
+             note_font, 28)
+    else:
+        wide("No reference taxonomy applied: add a query taxonomy reference to get "
+             "identification levels (organism, genus, family, order).", note_font, 28)
+
+    # ── Best-hit identity ──
+    if pident is not None and best:
+        bins = [("99 % or more", 99.0, 101.0), ("97 – 99 %", 97.0, 99.0),
+                ("95 – 97 %", 95.0, 97.0), ("Below 95 %", -1.0, 95.0)]
+        n_hit = len(best)
+        section("Best-hit identity", [unit, "%", "Share of the total"])
+        n_bins = 0
+        for lab, lo, hi in bins:
+            n = sum(1 for row, _n in best.values() if lo <= _to_float(row[pident]) < hi)
+            n_bins += n
+            put([lab, n, n / n_hit], pct_from=3)
+            bar_cell(n / n_hit)
+        total_row(["Total", n_bins, n_bins / n_hit], pct_col=3)
+        wide(f"P_identity of the best hit of each of the {n_hit:,} {unit.lower()} with hits.",
+             note_font)
+
+    # ── To review ──
+    section(f"{unit} to review", [unit])
+    if pident is not None:
+        put(["Best hit identity below 97 %", low_ident])
+    if not_first is not None:
+        put(["Best hit is not BLAST's first hit", not_first])
+    if has_match:
+        put([_ID_LABELS["none"], counts.get("none", 0)])
+    put([f"{unit} without hits", counts.get("no_hit", 0)])
+    if counts.get("not_searched"):
+        put([f"{unit} not searched", counts["not_searched"]])
+    ws.cell(row=r[0], column=1, value="Open the Best hit sheet (filter by Identification, "
+            "Hits or P_identity)").hyperlink = "#'Best hit'!A1"
+    ws.cell(row=r[0], column=1).font = Font(size=10, color="FF0563C1", underline="single")
+    r[0] += 1
+
+    # ── By file: "n (%)" text, plus a hidden numeric copy that feeds the chart ──
+    labels = _file_labels([f for f, _qs in inputs]) if inputs else []
+    with_qs = [(lab, qs) for lab, (f, qs) in zip(labels, inputs) if qs]
+    if len(with_qs) > 1:
+        section("Identification level by file", [lab for lab, _qs in with_qs] + ["Total"])
+        hdr_row = r[0] - 1
+        ws.row_dimensions[hdr_row].height = 62
+        tots = [len(set(qs)) for _l, qs in with_qs] + [n_total]
+        H0 = 9                                   # hidden helper block: columns I..
+        first_lv = r[0]
+        for j, (lab, _qs) in enumerate(with_qs):
+            ws.cell(row=hdr_row, column=H0 + 1 + j, value=lab)
+        for lv in levels:
+            per = [sum(1 for q in set(qs) if cats.get(q) == lv) for _l, qs in with_qs] + [counts[lv]]
+            put([_ID_LABELS[lv]] + [
+                f"{n:,} ({100.0 * n / t:.0f}%)" if t else f"{n:,}"
+                for n, t in zip(per, tots)])
+            for ci in range(2, NC + 1):
+                ws.cell(row=r[0] - 1, column=ci).alignment = Alignment(horizontal="right")
+            if lv in _ID_FILL:
+                ws.cell(row=r[0] - 1, column=1).fill = fill(_ID_FILL[lv])
+            ws.cell(row=r[0] - 1, column=H0, value=_ID_LABELS[lv])
+            for j, n in enumerate(per[:-1]):
+                ws.cell(row=r[0] - 1, column=H0 + 1 + j, value=n)
+        total_row(["Total"] + tots)
+        for ci in range(H0, H0 + 2 + len(with_qs)):
+            ws.column_dimensions[get_column_letter(ci)].hidden = True
+        chart = BarChart()
+        chart.type = "bar"
+        chart.grouping = "percentStacked"
+        chart.overlap = 100
+        chart.title = "Identification level by file"
+        chart.height, chart.width = 7.5, 22
+        chart.legend.position = "b"
+        chart.y_axis.majorGridlines = None       # no vertical guide lines
+        chart.visible_cells_only = False         # data sits in hidden columns
+        chart.add_data(Reference(ws, min_col=H0, max_col=H0 + len(with_qs),
+                                 min_row=first_lv, max_row=first_lv + len(levels) - 1),
+                       from_rows=True, titles_from_data=True)
+        chart.set_categories(Reference(ws, min_col=H0 + 1, max_col=H0 + len(with_qs),
+                                       min_row=hdr_row, max_row=hdr_row))
+        for series, lv in zip(chart.series, levels):
+            series.graphicalProperties.solidFill = _ID_FILL.get(lv, "FFD9D9D9")[2:]
+            series.graphicalProperties.line.solidFill = "FFFFFF"
+        r[0] += 1
+        ws.add_chart(chart, f"A{r[0]}")
+        r[0] += 16
+
+    # ── Run (duration, resumptions, NCBI problems) ──
+    sessions = run_info.get("sessions") or []
+    if kind == "search" and sessions:
+        section("Run", [""])
+        secs = sum(int(x.get("elapsed_s", 0)) for x in sessions)
+        put(["Duration", f"{secs // 3600}h {secs % 3600 // 60:02d}m {secs % 60:02d}s"])
+        if len(sessions) > 1:
+            put(["Sessions (run was resumed)", len(sessions)])
+        if any("left_aside" in x for x in sessions):
+            put(["Searches sent again (NCBI did not answer)",
+                 sum(int(x.get("rid_restarts", 0)) for x in sessions)])
+            put(["Sequences left aside (NCBI never answered)",
+                 int(sessions[-1].get("left_aside", 0))])
+        for rr in range(r[0] - (3 if any("left_aside" in x for x in sessions) else
+                                2 if len(sessions) > 1 else 1), r[0]):
+            ws.cell(row=rr, column=1).font = st["bold_font"]
+            ws.cell(row=rr, column=2).alignment = Alignment(horizontal="left")
+
+    # ── Input files, reference and paths (long, so they wrap across the sheet) ──
+    if inputs:
+        section("Input result files" if kind == "hit_table" else "Input FASTA files",
+                [unit, "Path"])
+        n_sum = 0
+        for lab, (f, qs) in zip(labels, inputs):
+            n_sum += len(qs or [])
+            put([lab, len(qs) if qs is not None else "n/a"])
+            ws.cell(row=r[0] - 1, column=3, value=os.path.abspath(f)).font = path_font
+            ws.merge_cells(start_row=r[0] - 1, start_column=3, end_row=r[0] - 1, end_column=NC)
+            ws.cell(row=r[0] - 1, column=3).alignment = Alignment(wrap_text=True, vertical="center")
+            ws.row_dimensions[r[0] - 1].height = 26
+        total_row(["Total", n_sum])
+        if n_total != n_sum:
+            put([f"Unique {unit.lower()} in the run", n_total], font=st["bold_font"])
+    ref = params.get("tax_reference") or ""
+    section("Taxonomy reference")
+    if ref:
+        put([os.path.basename(ref)])
+        ws.cell(row=r[0] - 1, column=2, value=os.path.abspath(ref)).font = path_font
+        ws.merge_cells(start_row=r[0] - 1, start_column=2, end_row=r[0] - 1, end_column=NC)
+        ws.cell(row=r[0] - 1, column=2).alignment = Alignment(wrap_text=True, vertical="center")
+        ws.row_dimensions[r[0] - 1].height = 26
+        put(["Sample-ID suffix removed", params.get("strip_suffix") or "(none)"])
+        ws.cell(row=r[0] - 1, column=2).alignment = Alignment(horizontal="left")
+    else:
+        put(["(none)"])
+
+    # Open on the Summary. Only one tab may be selected, or Excel groups them.
+    for sheet in wb.worksheets:
+        sheet.sheet_view.tabSelected = False
+    ws.sheet_view.tabSelected = True
+    wb.active = 0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -569,6 +1149,23 @@ class _BlastFileDropZone(QtWidgets.QFrame):
             self._add_files(paths)
 
 
+def hit_table_queries(path: str) -> List[str]:
+    """Query IDs (first column) of an NCBI 'Hit Table' export (.txt / .csv)."""
+    def load(p):
+        out = []
+        with open(p, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if not line.strip() or line.startswith("#"):
+                    continue
+                sep = "\t" if "\t" in line else ","
+                out.append(line.split(sep, 1)[0].strip())
+        return out
+    try:
+        return _cached(path, "hitq", load)
+    except Exception:
+        return []
+
+
 class _ReferenceFileGroup:
     """The optional 'query taxonomy reference file' control: a checkbox, a
     _RefDropZone and a description/validation label, together with the
@@ -642,6 +1239,9 @@ class _ReferenceFileGroup:
         self.info_label.hide()
 
         self.ok = False
+        self.found = None             # sample IDs found in the reference (None: unknown)
+        self._names_provider = None   # () -> query names to check against it
+        self.suffix_edit.textChanged.connect(lambda _t: self._describe())
         self._describe()   # seed the hint text shown before any file is set
 
     def add_to(self, form: QtWidgets.QFormLayout):
@@ -666,6 +1266,16 @@ class _ReferenceFileGroup:
         """The suffix to strip from the sample ID, or '' when the checkbox is off."""
         return self.suffix_edit.text().strip() if self.checked else ""
 
+    def set_names_provider(self, provider):
+        """provider() -> the query names (FASTA headers / Query_name values)
+        of the data the reference will be applied to, for the match check."""
+        self._names_provider = provider
+        self._describe()
+
+    def refresh_check(self):
+        """Re-run the match check after the data files changed."""
+        self._describe()
+
     def _on_toggled(self, checked: bool):
         self.zone.setVisible(checked)
         self.suffix_label.setVisible(checked)
@@ -679,6 +1289,7 @@ class _ReferenceFileGroup:
     def _describe(self):
         """Validate the reference file and describe how it will be read."""
         self.ok = False
+        self.found = None
         path = self.zone.path
         if not path:
             self.info_label.setText(
@@ -689,17 +1300,29 @@ class _ReferenceFileGroup:
             self.info_label.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
             return
         try:
-            id_col, tax_cols, table = read_tax_reference(path)
+            id_col, tax_cols, table = read_tax_reference_cached(path)
         except Exception as exc:
             self.info_label.setText(f"⚠  {exc}")
             self.info_label.setStyleSheet(f"color:{RED}; font-size:14px;")
             return
         self.ok = True
+        check = ""
+        if self.checked and self._names_provider is not None:
+            try:
+                names = self._names_provider() or []
+            except Exception:
+                names = []
+            suffix = self.suffix_edit.text().strip()
+            check, colour, found, total = reference_match_check(
+                [sample_id_of(n, suffix) for n in names], table)
+            if total:
+                self.found = found
         self.info_label.setText(
             f"{len(table):,} entries  ·  identifier: <b>{id_col}</b>  ·  "
             f"<b>{' · '.join(tax_cols)}</b> → Query_Order · Query_Family · "
             f"Query_Genus · Query_organism.<br>"
             f"These columns will be added to the results table."
+            + (f"<br><span style='color:{colour}'><b>{check}</b></span>" if check else "")
         )
         self.info_label.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
 
@@ -713,6 +1336,15 @@ class _ReferenceFileGroup:
                 "'I have a reference file with the query taxonomy'."
             )
             return False
+        self._describe()   # the data may have changed since the last check
+        if self.checked and self.found == 0:
+            return QtWidgets.QMessageBox.question(
+                parent, "Reference file",
+                "No sample ID of the input was found in the reference file, so "
+                "no query taxonomy would be written (see the reference check).\n\n"
+                "Continue anyway?",
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.No) == QtWidgets.QMessageBox.Yes
         return True
 
     def retranslateUi(self, ctx: str):
@@ -817,6 +1449,9 @@ class _ApplyReferenceDialog(QtWidgets.QDialog):
         ref_form.setLabelAlignment(QtCore.Qt.AlignRight)
         ref_form.setSpacing(10)
         self._ref_group.add_to(ref_form)
+        self._ref_group.set_names_provider(
+            lambda: table_column(self._tsv_zone.path, "Query_name")
+            if self._tsv_zone.path else [])
         v.addLayout(ref_form)
 
         self._status = QtWidgets.QLabel("")
@@ -839,6 +1474,7 @@ class _ApplyReferenceDialog(QtWidgets.QDialog):
         v.addLayout(btns)
 
     def _on_changed(self, *_args):
+        self._ref_group.refresh_check()
         self._apply_btn.setEnabled(bool(self._tsv_zone.path))
         self._set_status("")
 
@@ -898,14 +1534,25 @@ class _ApplyReferenceDialog(QtWidgets.QDialog):
             if unknown:
                 examples = ", ".join(sorted(unknown)[:5])
                 msg += f"  {len(unknown)} sample ID(s) not found in the reference (e.g. {examples})."
+            suffix = self._ref_group.suffix
+            empty = reference_empty_ids(
+                [sample_id_of(q, suffix) for q in table_column(tsv_path, "Query_name")],
+                ref_table)
+            if empty:
+                msg += (f"  {len(empty)} sample ID(s) in the reference with empty "
+                        f"taxonomy (e.g. {', '.join(empty[:5])}).")
             if n_match >= 0:
                 msg += f"  Tax_level_match updated on {n_match} row(s)."
+            _fmt = reference_format_warning(ref_table)
+            if _fmt:
+                msg += "  ⚠ " + _fmt
 
             # Regenerate the matching .xlsx from the just-updated table, overwriting
             # whichever one (if any) sits next to it — otherwise it would keep
             # showing the pre-fix taxonomy even though the .tsv is now correct.
             try:
-                xlsx_path = build_xlsx_from_tsv(tsv_path)
+                xlsx_path = build_xlsx_from_tsv(tsv_path, params_override={
+                    "tax_reference": ref_path, "strip_suffix": suffix})
                 if xlsx_path:
                     msg += f"  {os.path.basename(xlsx_path)} updated."
             except Exception as exc:
@@ -929,6 +1576,52 @@ class _FullWidthTabBar(QtWidgets.QTabBar):
         return QtCore.QSize(bar_width // count, size.height())
 
 
+class _TwoLineTabBar(_FullWidthTabBar):
+    """Tabs whose text is "title\nsubtitle", with the title TITLE_GROW
+    px larger than the subtitle.
+
+    A tab's text has one font, and the style sheet's ::tab font-size wins over
+    any font set on the painter. So both lines are drawn through the style at
+    the sheet's size (SUB_PX) — which keeps their colour following the tab
+    states (selected, hover) — and the title is drawn scaled up. The sheet
+    must give ::tab font-size: SUB_PX and no vertical padding.
+    """
+    SUB_PX     = 15
+    TITLE_GROW = 4
+
+    def paintEvent(self, event):
+        painter = QtWidgets.QStylePainter(self)
+        font = QtGui.QFont(self.font())
+        font.setPixelSize(self.SUB_PX)
+        line_h = QtGui.QFontMetrics(font).height()
+        scale = (self.SUB_PX + self.TITLE_GROW) / self.SUB_PX
+        for i in range(self.count()):
+            opt = QtWidgets.QStyleOptionTab()
+            self.initStyleOption(opt, i)
+            title, _, sub = opt.text.partition("\n")
+            opt.text = ""
+            painter.drawControl(QtWidgets.QStyle.CE_TabBarTabShape, opt)
+            lines = [(title, scale)] + ([(sub, 1.0)] if sub else [])
+            heights = [round(line_h * k) for _t, k in lines]
+            y = opt.rect.center().y() - sum(heights) // 2 + 1
+            cx = opt.rect.center().x()
+            for (text, k), h in zip(lines, heights):
+                cy = y + h // 2
+                line = QtWidgets.QStyleOptionTab(opt)
+                line.text = text
+                # The style sheet stretches the label rect back to the tab's
+                # min-height and centres the text in it, so pass a full-height
+                # rect centred on this line (in the scaled coordinates).
+                line.rect = opt.rect.translated(0, cy - opt.rect.center().y())
+                painter.save()
+                painter.translate(cx, cy)
+                painter.scale(k, k)
+                painter.translate(-cx, -cy)
+                painter.drawControl(QtWidgets.QStyle.CE_TabBarTabLabel, line)
+                painter.restore()
+                y += h
+
+
 class _FullWidthTabWidget(QtWidgets.QTabWidget):
     """QTabWidget whose tab bar is forced to the widget's own width on every
     resize, so _FullWidthTabBar has the full width to split across tabs
@@ -947,9 +1640,20 @@ class _FullWidthTabWidget(QtWidgets.QTabWidget):
 class BlastPanel(QtWidgets.QWidget):
     blastRequested     = QtCore.pyqtSignal(list, dict)   # files, config dict
     stopRequested      = QtCore.pyqtSignal()             # user clicked Stop (tab 1)
+    resumeRequested    = QtCore.pyqtSignal(str, dict)    # run's .state.json, config (API key, param_changes)
     blastFileRequested = QtCore.pyqtSignal(list, dict)   # result files, config dict (tab 2)
     stopFileRequested  = QtCore.pyqtSignal()             # user clicked Stop (tab 2)
     sendToBestSeq      = QtCore.pyqtSignal(list)         # [fasta, results] pair of the last run
+
+    # (title, subtitle) of each tab
+    _TAB_TEXTS = (
+        ("BLAST API Search", "Send your FASTA to NCBI from here"),
+        ("BLAST web results", "Use a Hit Table downloaded from the NCBI website"),
+    )
+
+    def _tab_text(self, index: int, ctx: str = "BlastPanel") -> str:
+        title, sub = self._TAB_TEXTS[index]
+        return f"{_tr(ctx, title)}\n{_tr(ctx, sub)}"
 
     _DATABASES        = ["core_nt", "nt", "refseq_rna", "16S_ribosomal_RNA"]
     _PROGRAMS         = ["blastn&MEGABLAST=on", "blastn", "megablast"]
@@ -998,7 +1702,7 @@ class BlastPanel(QtWidgets.QWidget):
 
         # ── Settings group ──
         self._settings_box = QtWidgets.QGroupBox("BLAST Settings")
-        self._settings_box.setStyleSheet("QGroupBox { font-weight:600; color:#1A1A2E; }")
+        self._settings_box.setStyleSheet(group_box_style())
         sg = QtWidgets.QFormLayout(self._settings_box)
         sg.setLabelAlignment(QtCore.Qt.AlignRight)
         sg.setSpacing(10)
@@ -1088,6 +1792,27 @@ class BlastPanel(QtWidgets.QWidget):
         self._lbl_hits = QtWidgets.QLabel("Hits per sequence (1–100):")
         sg.addRow(self._lbl_hits, hits_row)
 
+        tries_row = QtWidgets.QWidget()
+        tl = QtWidgets.QHBoxLayout(tries_row)
+        tl.setContentsMargins(0, 0, 0, 0)
+        self._tries_spin = QtWidgets.QSpinBox()
+        self._tries_spin.setRange(2, 30)
+        self._tries_spin.setValue(5)
+        self._tries_spin.setFixedWidth(80)
+        self._tries_spin.setToolTip(
+            "How many times to ask NCBI for the result\n"
+            "of a search (about one minute apart) before\n"
+            "giving up and sending the same sequences\n"
+            "again as a new search.\n"
+            "A search that works is normally ready within\n"
+            "a minute; raise this only if your batches are\n"
+            "big and legitimately take longer.")
+        tl.addWidget(self._tries_spin)
+        tl.addStretch()
+        self._lbl_tries = QtWidgets.QLabel("Result checks per search (2–30):")
+        self._lbl_tries.setToolTip(self._tries_spin.toolTip())
+        sg.addRow(self._lbl_tries, tries_row)
+
         batch_row = QtWidgets.QWidget()
         bl2 = QtWidgets.QHBoxLayout(batch_row)
         bl2.setContentsMargins(0, 0, 0, 0)
@@ -1106,11 +1831,13 @@ class BlastPanel(QtWidgets.QWidget):
         # NCBI's documented limit is total query length (1,000,000 bases for
         # blastn), not a sequence count — but in practice its undocumented
         # CPU-time budget for a MEGABLAST job against core_nt rejects a batch
-        # well before that: 500 and 250 sequences/batch both failed in testing,
-        # 100 was the first size that worked reliably, hence the default below.
+        # well before that: 500 and 250 sequences/batch both failed in testing
+        # and 100 was the first size that worked reliably. The default below
+        # is half that: on a busy public queue 100-sequence searches can still
+        # wait for most of the poll budget, and smaller ones return sooner.
         # The worker also auto-splits a batch NCBI still rejects at run time.
         self._batch_spin.setRange(1, 1000)
-        self._batch_spin.setValue(100)
+        self._batch_spin.setValue(50)
         self._batch_spin.setFixedWidth(80)
         self._batch_spin.valueChanged.connect(self._update_batch_plan)
         bl2.addWidget(self._batch_spin)
@@ -1140,6 +1867,13 @@ class BlastPanel(QtWidgets.QWidget):
         self._lbl_plan.setStyleSheet(f"color:{TEXT_HINT}; font-size:14px;")
         sg.addRow("", self._lbl_plan)
 
+        # Repeated headers among the loaded FASTA files (see _update_repeat_note).
+        self._lbl_repeats = QtWidgets.QLabel("")
+        self._lbl_repeats.setWordWrap(True)
+        self._lbl_repeats.setStyleSheet("color:#B45309; font-size:14px;")
+        self._lbl_repeats.hide()
+        sg.addRow("", self._lbl_repeats)
+
 
         self._tax_check = QtWidgets.QCheckBox("Fetch organism + taxonomic classification")
         self._tax_check.setChecked(True)
@@ -1152,13 +1886,17 @@ class BlastPanel(QtWidgets.QWidget):
         self._ref_group = _ReferenceFileGroup()
         self._ref_group.apply_link.clicked.connect(self._open_apply_reference_dialog)
         self._ref_group.add_to(sg)
+        self._ref_group.set_names_provider(
+            lambda: [h.replace(" ", "_")
+                     for f in self._drop.files for h in fasta_headers(f)])
 
         self._layout.addWidget(self._settings_box)
 
-        # ── Drop zone ──
+        # ── Drop zone: above the settings (load → configure → run), as in
+        # the other panels; the reference check below reads these files ──
         self._drop = MultiDropZone()
         self._drop.filesDropped.connect(self._on_files)
-        self._layout.addWidget(self._drop)
+        self._layout.insertWidget(self._layout.indexOf(self._settings_box), self._drop)
         self._layout.addStretch()   # packs content at top; log lives outside the scroll
 
         # ── Live progress display (outside scroll so it expands to fill space) ──
@@ -1204,19 +1942,12 @@ class BlastPanel(QtWidgets.QWidget):
         self._clear_btn.clicked.connect(self._reset)
         fl.addWidget(self._clear_btn)
 
-        self._open_folder_btn = QtWidgets.QPushButton("Open folder  📂")
+        self._open_folder_btn = QtWidgets.QPushButton("Open folder")
         self._open_folder_btn.setObjectName("secondary_btn")
         self._open_folder_btn.setFixedHeight(44)
         self._open_folder_btn.hide()
         self._open_folder_btn.clicked.connect(self._open_output_folder)
         fl.addWidget(self._open_folder_btn)
-
-        self._open_results_btn = QtWidgets.QPushButton("Open results  📄")
-        self._open_results_btn.setObjectName("secondary_btn")
-        self._open_results_btn.setFixedHeight(44)
-        self._open_results_btn.hide()
-        self._open_results_btn.clicked.connect(self._open_results_file)
-        fl.addWidget(self._open_results_btn)
 
         # Hands the queried FASTA + its results table to Best Sequence as a
         # ready-made pair (same base name), so nothing has to be re-selected.
@@ -1241,17 +1972,34 @@ class BlastPanel(QtWidgets.QWidget):
 
         fl.addStretch()
 
+        # Continues a stopped or incomplete run in its own files (see
+        # _BlastWorker._load_resume), so its results end up in one table.
+        self._resume_btn = QtWidgets.QPushButton("Resume run…")
+        self._resume_btn.setObjectName("secondary_btn")
+        self._resume_btn.setFixedHeight(44)
+        self._resume_btn.setToolTip(
+            "Continue a stopped or incomplete BLAST run: only its missing sequences\n"
+            "are searched and their hits are added to the same results table.\n"
+            "Pick the blast-<date>.state.json in the run's folder.")
+        self._resume_btn.clicked.connect(self._emit_resume)
+        fl.addWidget(self._resume_btn)
+        fl.addSpacing(8)
+
         self._blast_btn = QtWidgets.QPushButton("Run BLAST  →")
         self._blast_btn.setObjectName("primary_btn")
         self._blast_btn.setFixedHeight(44)
-        self._blast_btn.setFixedWidth(300)
+        # Up to 300 px, but gives way down to 200 px so a narrow window
+        # does not clip it once the after-run buttons are shown.
+        self._blast_btn.setMinimumWidth(200)
+        self._blast_btn.setMaximumWidth(300)
+        self._blast_btn.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self._blast_btn.setEnabled(False)
         self._blast_btn.clicked.connect(self._emit_blast)
         self._blast_btn.setStyleSheet(
             f"QPushButton {{ background-color: {GRAY_LINE}; color: {TEXT_HINT}; border:none; "
             f"border-radius:8px; padding:9px 20px; font-size:18px; font-weight:500; }}"
         )
-        fl.addWidget(self._blast_btn)
+        fl.addWidget(self._blast_btn, 1)   # takes free space first, up to its 300 px
         outer_layout.addWidget(footer)
 
         # path -> ((mtime, size), [lengths]) so the plan refreshes only when
@@ -1266,9 +2014,31 @@ class BlastPanel(QtWidgets.QWidget):
         self._page2 = self._build_file_tab()
 
         self._tabs = _FullWidthTabWidget()
-        self._tabs.setTabBar(_FullWidthTabBar())
-        self._tabs.addTab(self._page1, "BLAST API Search")
-        self._tabs.addTab(self._page2, "BLAST web results")
+        self._tabs.setTabBar(_TwoLineTabBar())
+        self._tabs.addTab(self._page1, self._tab_text(0))
+        self._tabs.addTab(self._page2, self._tab_text(1))
+        # Card-style tabs with a one-line subtitle: a plain text tab next to
+        # the active one was easy to miss, and with it the whole second way
+        # of getting results (the NCBI website's Hit Table).
+        self._tabs.tabBar().setStyleSheet(f"""
+            QTabBar::tab {{
+                background: #EDEDED; color: {TEXT_SEC};
+                font-size: {_TwoLineTabBar.SUB_PX}px; font-weight: 600;
+                min-height: 65px; padding: 0 14px; margin: 0 6px 0 0;
+                border: 1px solid {GRAY_LINE}; border-bottom: none;
+                border-top-left-radius: 10px; border-top-right-radius: 10px;
+            }}
+            QTabBar::tab:last {{ margin-right: 0; }}
+            QTabBar::tab:selected {{
+                background: {BLUE}; color: white; border-color: {BLUE};
+            }}
+            QTabBar::tab:!selected:hover {{ background: {BLUE_LIGHT}; color: {BLUE}; }}
+        """)
+        # The pane takes the panel's own ground, like every other panel; the
+        # app's pane rule fills it with the card colour, which reads as white.
+        self._tabs.setStyleSheet(
+            f"QTabWidget::pane {{ border: none; border-top: 3px solid {BLUE};"
+            f" background: transparent; }}")
 
         root_layout = QtWidgets.QVBoxLayout(self)
         root_layout.setContentsMargins(0, 0, 0, 0)
@@ -1327,14 +2097,34 @@ class BlastPanel(QtWidgets.QWidget):
         auto = index == 0
         # In Automatic the number is the program's decision, so the box has
         # nothing to offer: hide it and let the plan line below state the
-        # result. It keeps holding the computed value, which becomes the
-        # starting point if the user switches to Manual.
+        # result. The box keeps the user's own number (default 50) for Manual;
+        # it is never overwritten with the computed value.
         self._batch_spin.setVisible(not auto)
         self._update_batch_plan()
+
+    def _loaded_repeats(self):
+        """{header: copies} of the headers repeated within or across the loaded
+        files, as the search submits them (spaces as '_')."""
+        if len(self._drop.files) == 1:
+            return repeated_headers(list(fasta_headers(self._drop.files[0])), True)
+        headers = [h for f in self._drop.files for h in fasta_headers(f)]
+        return repeated_headers(headers, True)
+
+    def _update_repeat_note(self):
+        repeats = self._loaded_repeats() if self._drop.files else {}
+        if not repeats:
+            self._lbl_repeats.hide()
+            return
+        self._lbl_repeats.setText(
+            f"⚠ {repeated_note(repeats)}. A repeated header is one Query_name in "
+            f"the results table: the hits of its copies are mixed in the same rows, "
+            f"so they cannot be told apart. Give each sequence its own header.")
+        self._lbl_repeats.show()
 
     def _update_batch_plan(self, *_):
         """Show how the loaded sequences will be split, for the current mode."""
         ctx = "BlastPanel"
+        self._update_repeat_note()
         lengths = self._seq_lengths()
         auto = self._batch_mode.currentIndex() == 0
 
@@ -1344,11 +2134,6 @@ class BlastPanel(QtWidgets.QWidget):
             return
 
         nseq = self._effective_nseq(lengths)
-        if auto:
-            # Reflect the decision in the spin without re-entering this slot.
-            self._batch_spin.blockSignals(True)
-            self._batch_spin.setValue(min(nseq, self._batch_spin.maximum()))
-            self._batch_spin.blockSignals(False)
 
         sizes = plan_batch_sizes(lengths, nseq)
         n = len(sizes)
@@ -1490,6 +2275,7 @@ class BlastPanel(QtWidgets.QWidget):
         self._lbl_prog.setText(_tr(ctx, "Program:"))
         self._lbl_hits.setText(_tr(ctx, "Hits per sequence (1–100):"))
         self._lbl_batch.setText(_tr(ctx, "Sequences per BLAST search:"))
+        self._lbl_tries.setText(_tr(ctx, "Result checks per search (2–30):"))
         self._ncbi_warn_icon.setToolTip(_tr(ctx, "NCBI usage policy — click to read"))
         _mode = self._batch_mode.currentIndex()
         self._batch_mode.blockSignals(True)
@@ -1502,13 +2288,12 @@ class BlastPanel(QtWidgets.QWidget):
         self._tax_check.setText(_tr(ctx, "Fetch organism + taxonomy"))
         self._ref_group.retranslateUi(ctx)
         self._clear_btn.setText(_tr(ctx, "Clear"))
-        self._open_folder_btn.setText(_tr(ctx, "Open folder  📂"))
-        self._open_results_btn.setText(_tr(ctx, "Open results  📄"))
+        self._open_folder_btn.setText(_tr(ctx, "Open folder"))
         self._blast_btn.setText(_tr(ctx, "Run BLAST  →"))
         self._drop.retranslateUi()
 
-        self._tabs.setTabText(0, _tr(ctx, "BLAST API Search"))
-        self._tabs.setTabText(1, _tr(ctx, "BLAST web results"))
+        for i in range(len(self._TAB_TEXTS)):
+            self._tabs.setTabText(i, self._tab_text(i, ctx))
 
         self._file_lbl_title.setText(_tr(ctx, "BLAST Web Results"))
         self._file_lbl_desc.setText(_tr(ctx,
@@ -1528,8 +2313,8 @@ class BlastPanel(QtWidgets.QWidget):
             "Uses the NCBI API key configured in the 'BLAST API Search' tab."))
         self._file_ref_group.retranslateUi(ctx)
         self._file_clear_btn.setText(_tr(ctx, "Clear"))
-        self._file_open_folder_btn.setText(_tr(ctx, "Open folder  📂"))
-        self._file_open_results_btn.setText(_tr(ctx, "Open results  📄"))
+        self._file_open_folder_btn.setText(_tr(ctx, "Open folder"))
+        self._file_open_results_btn.setText(_tr(ctx, "Open results"))
         self._file_run_btn.setText(_tr(ctx, "Parse results  →"))
         self._file_drop.retranslateUi()
 
@@ -1541,6 +2326,7 @@ class BlastPanel(QtWidgets.QWidget):
     # ── Slots ─────────────────────────────────────────────────────────────
 
     def _on_files(self, paths):
+        self._ref_group.refresh_check()
         enabled = len(paths) >= 1
         self._blast_btn.setEnabled(enabled)
         if enabled:
@@ -1569,19 +2355,70 @@ class BlastPanel(QtWidgets.QWidget):
             "program":        self._PROGRAMS[self._prog_combo.currentIndex()],
             "nhits":          self._hits_spin.value(),
             "nseq":           self._effective_nseq(),
+            "rid_tries":      self._tries_spin.value(),
             "fetch_taxonomy": self._tax_check.isChecked(),
             "tax_reference":  self._ref_group.path,
             "strip_suffix":   self._ref_group.suffix,
         }
         self.blastRequested.emit(list(self._drop.files), cfg)
 
+    def _emit_resume(self):
+        # Open on the last run's state file when there is one, so resuming
+        # the run just stopped is a single click.
+        start = os.path.join(_get_base_dir(), "output")
+        if self._last_outdir and os.path.isdir(self._last_outdir):
+            start = self._last_outdir
+            states = sorted(
+                (os.path.join(start, f) for f in os.listdir(start)
+                 if f.startswith("blast-") and f.endswith(".state.json")),
+                key=os.path.getmtime, reverse=True)
+            if states:
+                start = states[0]
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Resume a BLAST run — pick its state file",
+            start,
+            "BLAST run state (blast-*.state.json)")
+        if not path:
+            return
+        # The run keeps its own parameters (saved in the state file) and the
+        # API key comes from the panel. Hits per sequence and sequences per
+        # batch may change between sessions without making the table
+        # inconsistent — but only when the user confirms it, since the panel
+        # may simply hold its defaults after a restart.
+        cfg = {"api_key": self._api_key_edit.text().strip(),
+               "rid_tries": self._tries_spin.value()}
+        try:
+            with open(path, encoding="utf-8") as fh:
+                params = json.load(fh).get("params") or {}
+        except Exception:
+            params = {}   # the worker reports an unreadable state file
+        panel = {"nhits": self._hits_spin.value()}
+        if self._batch_mode.currentIndex() != 0:      # Manual: a number the user chose
+            panel["nseq"] = self._batch_spin.value()
+        changed = {k: v for k, v in panel.items() if params.get(k) and params[k] != v}
+        if changed:
+            names = {"nhits": "Hits per sequence", "nseq": "Sequences per BLAST search"}
+            diff = "\n".join(f"   {names[k]}: {params[k]} → {v}" for k, v in changed.items())
+            box = QtWidgets.QMessageBox(self)
+            box.setIcon(QtWidgets.QMessageBox.Question)
+            box.setWindowTitle("Resume BLAST run")
+            box.setText("The panel's settings differ from the ones this run used:\n\n"
+                        f"{diff}\n\nWhich ones should the rest of the run use?")
+            box.setInformativeText("Database, program and taxonomy always stay as in the run.")
+            use_new  = box.addButton("Use the panel's", QtWidgets.QMessageBox.AcceptRole)
+            keep_old = box.addButton("Keep the run's", QtWidgets.QMessageBox.RejectRole)
+            box.addButton(QtWidgets.QMessageBox.Cancel)
+            box.setDefaultButton(keep_old)
+            box.exec_()
+            if box.clickedButton() not in (use_new, keep_old):
+                return
+            if box.clickedButton() is use_new:
+                cfg["param_changes"] = changed
+        self.resumeRequested.emit(path, cfg)
+
     def _open_output_folder(self):
         if self._last_outdir and os.path.isdir(self._last_outdir):
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._last_outdir))
-
-    def _open_results_file(self):
-        if self._last_tsv and os.path.isfile(self._last_tsv):
-            QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(self._last_tsv))
 
     def _reset(self):
         self._drop.clear()
@@ -1592,7 +2429,6 @@ class BlastPanel(QtWidgets.QWidget):
         self._log.clear()
         self._log.hide()
         self._open_folder_btn.hide()
-        self._open_results_btn.hide()
         self._send_best_btn.hide()
         self._best_seq_pair = []
         self._stop_btn.hide()
@@ -1643,6 +2479,7 @@ class BlastPanel(QtWidgets.QWidget):
 
     def set_running(self, running: bool):
         self._blast_btn.setVisible(not running)
+        self._resume_btn.setVisible(not running)
         self._stop_btn.setVisible(running)
         self._clear_btn.setEnabled(not running)
         if running:
@@ -1681,7 +2518,6 @@ class BlastPanel(QtWidgets.QWidget):
                 )
                 if matches:
                     self._last_tsv = matches[0]
-                    self._open_results_btn.show()
                     break
             # FASTA saved by the worker with the same base name as the table
             if self._last_tsv:
@@ -1749,7 +2585,7 @@ class BlastPanel(QtWidgets.QWidget):
 
         # ── Settings group ──
         self._file_settings_box = QtWidgets.QGroupBox("BLAST File Settings")
-        self._file_settings_box.setStyleSheet("QGroupBox { font-weight:600; color:#1A1A2E; }")
+        self._file_settings_box.setStyleSheet(group_box_style())
         sg = QtWidgets.QFormLayout(self._file_settings_box)
         sg.setLabelAlignment(QtCore.Qt.AlignRight)
         sg.setSpacing(10)
@@ -1786,13 +2622,15 @@ class BlastPanel(QtWidgets.QWidget):
         self._file_ref_group = _ReferenceFileGroup()
         self._file_ref_group.apply_link.clicked.connect(self._open_apply_reference_dialog)
         self._file_ref_group.add_to(sg)
+        self._file_ref_group.set_names_provider(
+            lambda: [q for f in self._file_drop.files for q in hit_table_queries(f)])
 
         lay.addWidget(self._file_settings_box)
 
-        # ── Drop zone ──
+        # ── Drop zone: above the settings, as in tab 1 ──
         self._file_drop = _BlastFileDropZone()
         self._file_drop.filesDropped.connect(self._on_file_files)
-        lay.addWidget(self._file_drop)
+        lay.insertWidget(lay.indexOf(self._file_settings_box), self._file_drop)
         lay.addStretch()
 
         # ── Live progress display ──
@@ -1838,14 +2676,14 @@ class BlastPanel(QtWidgets.QWidget):
         self._file_clear_btn.clicked.connect(self._reset_file_tab)
         fl.addWidget(self._file_clear_btn)
 
-        self._file_open_folder_btn = QtWidgets.QPushButton("Open folder  📂")
+        self._file_open_folder_btn = QtWidgets.QPushButton("Open folder")
         self._file_open_folder_btn.setObjectName("secondary_btn")
         self._file_open_folder_btn.setFixedHeight(44)
         self._file_open_folder_btn.hide()
         self._file_open_folder_btn.clicked.connect(self._open_file_output_folder)
         fl.addWidget(self._file_open_folder_btn)
 
-        self._file_open_results_btn = QtWidgets.QPushButton("Open results  📄")
+        self._file_open_results_btn = QtWidgets.QPushButton("Open results")
         self._file_open_results_btn.setObjectName("secondary_btn")
         self._file_open_results_btn.setFixedHeight(44)
         self._file_open_results_btn.hide()
@@ -1891,6 +2729,7 @@ class BlastPanel(QtWidgets.QWidget):
             self._file_log.setFixedHeight(target_height)
 
     def _on_file_files(self, paths):
+        self._file_ref_group.refresh_check()
         enabled = len(paths) >= 1 and not self._file_run_locked
         self._file_run_btn.setEnabled(enabled)
         if enabled:
@@ -2070,6 +2909,14 @@ class _BlastWorker(QtCore.QThread):
     _POLL_MIN     = 60    # polling interval while the job still looks quick
     _POLL_MAX     = 120   # interval cap once the job is clearly a long one
     _POLL_FAST_S  = 300   # keep the short interval for this long before backing off
+    # NCBI sometimes never delivers an RID's result (empty replies, or WAITING
+    # forever) while the same job resubmitted is ready within ~1 min. So every
+    # poll that is not READY counts: after _STALL_MAX the RID is abandoned and
+    # the batch is submitted from scratch with a new RID, at most
+    # _MAX_RESTARTS times before the usual batch split / "missing" handling.
+    _STALL_MAX    = 5     # default; the panel's "Result checks per search" overrides
+    _MAX_RESTARTS = 3
+    _STALLED      = "NCBI stopped answering for this RID"
     _BLAST_GAP    = 10.0  # min seconds between ANY two Blast.cgi requests
     # Max seconds blocked in one socket operation (connect, or one read — not
     # the whole download). Bounds how long Stop can take to unwind a request.
@@ -2128,8 +2975,58 @@ class _BlastWorker(QtCore.QThread):
         self._rate_limit_count = 0
         self._server_err_count = 0
 
+        # Resumable-run state (blast-<run_id>.state.json), see _save_state.
+        self._state: Optional[dict] = None
+        self._state_path = ""
+        self._processed: set = set()   # Query_names answered and written to the TSV
+        self._stalled_ids: set = set()  # Query_names of batches NCBI never answered
+        self._session: dict = {}
+        self._session_t0 = 0.0
+
     def stop(self):
         self._stop = True
+
+    # ── Resumable-run state ───────────────────────────────────────────────
+    # blast-<run_id>.state.json sits next to the run's .fa and .tsv and is
+    # rewritten after every batch. It records which sequences already reached
+    # the TSV — including those BLAST found no match for, which leave no row —
+    # and the run's parameters, so a stopped run can be resumed into the same
+    # files (see _load_resume).
+
+    _STATE_VERSION = 1
+
+    def _save_state(self, status: str = ""):
+        """Write the state file atomically. Never raises: losing the ability
+        to resume must not abort the run itself."""
+        st = self._state
+        if st is None or not self._state_path:
+            return
+        if status:
+            st["status"] = status
+            self._session["status"] = status
+        self._session["elapsed_s"] = int(time.monotonic() - self._session_t0)
+        st["processed"] = sorted(self._processed)
+        tmp = self._state_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(st, fh, indent=1)
+            os.replace(tmp, self._state_path)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _changes_text(changes: dict) -> str:
+        names = {"nhits": "hits/seq", "nseq": "seqs/batch"}
+        return ", ".join(f"{names.get(k, k)} {old} → {new}"
+                         for k, (old, new) in changes.items())
+
+    @staticmethod
+    def _remove_stale(path: str):
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+        except OSError:
+            pass
 
     def _rate_acquire(self, url: str = ""):
         """Block until the next NCBI request slot is available: one Blast.cgi
@@ -2189,7 +3086,7 @@ class _BlastWorker(QtCore.QThread):
             ctx.verify_flags &= ~strict
         return ctx
 
-    def _http_get(self, url, params=None, timeout=60):
+    def _http_get(self, url, params=None, timeout=60, max_attempts=None):
         import urllib.request, urllib.parse, urllib.error
         params = self._eutils_params(url, params)
         if params:
@@ -2197,7 +3094,7 @@ class _BlastWorker(QtCore.QThread):
         if url.startswith(self._BLAST_URL) and "tool=" not in url:
             url += ("&" if "?" in url else "?") + f"tool={self._NCBI_TOOL}"
         timeout = min(timeout, self._SOCK_TIMEOUT)
-        for attempt in range(self._MAX_RETRY):
+        for attempt in range(max_attempts or self._MAX_RETRY):
             if self._stop:
                 return ""
             self._rate_acquire(url)
@@ -2353,21 +3250,13 @@ class _BlastWorker(QtCore.QThread):
             out.append("".join(seq_parts))
         return "\n".join(out)
 
-    def _split_batches(self, fasta_text, nseq):
-        """Return (batches, batch_pairs_list).
-        batches[i]       – FASTA text string for batch i
-        batch_pairs_list[i] – list of (header, seq) tuples for batch i
-
-        A batch is capped both by `nseq` and by _MAX_QUERY_BASES: NCBI rejects
-        a blastn query longer than 1,000,000 bases, and that length — not a
-        sequence count — is its real per-search limit. A single sequence above
-        the cap is still sent on its own: letting NCBI reject it is better than
-        dropping it silently.
-        """
-        # `fasta_text` comes from _to_single_line_fasta(): each header is followed by
-        # exactly one sequence line (possibly empty). Do NOT drop blank lines here —
-        # filtering an empty sequence line would shift the next header into its place
-        # and desync every header/seq pair from that point on.
+    @staticmethod
+    def _fasta_pairs(fasta_text):
+        """(header, seq) pairs of a FASTA from _to_single_line_fasta()."""
+        # Each header is followed by exactly one sequence line (possibly
+        # empty). Do NOT drop blank lines here — filtering an empty sequence
+        # line would shift the next header into its place and desync every
+        # header/seq pair from that point on.
         lines = fasta_text.splitlines()
         pairs = []
         i = 0
@@ -2379,17 +3268,24 @@ class _BlastWorker(QtCore.QThread):
                 i += 2
             else:
                 i += 1
-        batches = []
-        batch_pairs_list = []
+        return pairs
+
+    def _plan_batches(self, pairs, nseq):
+        """Split (header, seq) pairs into batches (lists of pairs).
+
+        A batch is capped both by `nseq` and by _MAX_QUERY_BASES: NCBI rejects
+        a blastn query longer than 1,000,000 bases, and that length — not a
+        sequence count — is its real per-search limit. A single sequence above
+        the cap is still sent on its own: letting NCBI reject it is better than
+        dropping it silently.
+        """
         sizes = plan_batch_sizes([len(s) for _, s in pairs], nseq,
                                  self._MAX_QUERY_BASES)
-        pos = 0
+        out, pos = [], 0
         for size in sizes:
-            chunk = pairs[pos:pos + size]
+            out.append(pairs[pos:pos + size])
             pos += size
-            batches.append("\n".join(a + "\n" + b for a, b in chunk))
-            batch_pairs_list.append(chunk)
-        return batches, batch_pairs_list
+        return out
 
     # ── BLAST API ─────────────────────────────────────────────────────────
 
@@ -2433,6 +3329,12 @@ class _BlastWorker(QtCore.QThread):
             return None, rtoe, reason
         return rid, rtoe, ""
 
+    def _stall_max(self):
+        try:
+            return max(2, int(self.cfg.get("rid_tries") or self._STALL_MAX))
+        except (TypeError, ValueError):
+            return self._STALL_MAX
+
     def _blast_poll(self, rid, batch_label=""):
         """Wait for one RID, up to _POLL_BUDGET seconds.
 
@@ -2450,17 +3352,19 @@ class _BlastWorker(QtCore.QThread):
         deadline = t0 + self._POLL_BUDGET
         prefix = f"BLAST       │ [{batch_label}] " if batch_label else "BLAST       │ "
 
-        def _progress(state=""):
-            elapsed = int(time.monotonic() - t0)
-            self.statusUpdated.emit(
-                "blast",
-                f"{prefix}Waiting for RID {rid}{state}… "
-                f"({elapsed // 60}m {elapsed % 60:02d}s of "
-                f"{self._POLL_BUDGET // 60}m max · try {polls})"
-            )
+        stalls = 0
+
+        def _progress():
+            if stalls:
+                msg = f"Fetching results: retry #{stalls}"
+            else:
+                msg = f"Waiting for RID {rid}…"
+            self.statusUpdated.emit("blast", f"{prefix}{msg}")
 
         while not self._stop and time.monotonic() < deadline:
-            resp = self._http_get(url)
+            # One attempt only: _http_get's own retry loop could block for
+            # many minutes on exactly the non-answers counted here.
+            resp = self._http_get(url, max_attempts=1)
             polls += 1
             if self._stop:
                 return False, "stopped"
@@ -2474,8 +3378,13 @@ class _BlastWorker(QtCore.QThread):
             if "Status=UNKNOWN" in resp:
                 self.statusUpdated.emit("blast", f"{prefix}Search expired for RID {rid}.")
                 return False, "search expired (RID UNKNOWN)"
-            # WAITING, or an empty/unrecognised reply: both mean "not yet".
-            _progress("" if "Status=WAITING" in resp else " (no status in reply)")
+            # Any reply that is not READY counts, WAITING included: a batch
+            # that works is READY within ~1 min, so a RID still WAITING after
+            # _STALL_MAX polls is treated as stuck and resubmitted.
+            stalls += 1
+            if stalls >= self._stall_max():
+                return False, self._STALLED
+            _progress()
             self._interruptible_sleep(interval)
             # Once a minute (the NCBI minimum per RID) for the first
             # _POLL_FAST_S; only once the job is clearly long does the
@@ -2495,17 +3404,27 @@ class _BlastWorker(QtCore.QThread):
             )
         return False, "timed out waiting for RID"
 
-    def _blast_get_tabular(self, rid):
+    def _blast_get_tabular(self, rid, batch_label=""):
+        """Download the tabular results; None after _STALL_MAX failed tries
+        (one per _POLL_MIN, the NCBI minimum per RID)."""
         url = (
             f"{self._BLAST_URL}"
             f"?CMD=Get&FORMAT_TYPE=Text&ALIGNMENT_VIEW=Tabular&RID={rid}"
         )
-        resp = self._http_get(url, timeout=120)
-        # A real reply (even with 0 hits) always carries '#' comment lines;
-        # an empty one means the download failed, not "no hits".
-        if not resp or "#" not in resp:
-            return None
-        return self._parse_tabular(resp)
+        prefix = f"BLAST       │ [{batch_label}] " if batch_label else "BLAST       │ "
+        for attempt in range(self._stall_max()):
+            resp = self._http_get(url, timeout=120, max_attempts=1)
+            if self._stop:
+                return None
+            # A real reply (even with 0 hits) always carries '#' comment
+            # lines; an empty one means the download failed, not "no hits".
+            if resp and "#" in resp:
+                return self._parse_tabular(resp)
+            self.statusUpdated.emit(
+                "blast", f"{prefix}Fetching results: retry #{attempt + 1}")
+            if attempt < self._stall_max() - 1:
+                self._interruptible_sleep(self._POLL_MIN)
+        return None
 
     def _parse_tabular(self, text):
         # Equivalent to: grep -A nhits '^#' | sed '/^#/d; /^--/d'
@@ -2858,6 +3777,81 @@ class _BlastWorker(QtCore.QThread):
         self._saved_tax_keys = set(self._taxadb.keys())
         self._saved_acc_keys = set(self._accdb.keys())
 
+    _TAX_NOT_FOUND = "Not_found_in_Taxonomy"
+    _N_TAX_FIELDS = 5    # Subject_Kingdom … Subject_Genus
+
+    def _tax_fields(self, org: str) -> str:
+        """The 5 tab-separated taxonomy fields of a hit row. An unresolved
+        lineage keeps the 5 columns (marker in Subject_Kingdom, '-' in the
+        rest), so Subject_organism never slides into the wrong column."""
+        tax = self._taxadb.get(org, self._TAX_NOT_FOUND) if org else self._TAX_NOT_FOUND
+        if tax == self._TAX_NOT_FOUND:
+            return "\t".join([self._TAX_NOT_FOUND] + ["-"] * (self._N_TAX_FIELDS - 1))
+        return tax
+
+    def _repair_taxonomy_rows(self, tsv_path: str) -> Tuple[int, int]:
+        """Final pass over the table: every hit has an accession, and every
+        accession has an organism and a lineage in NCBI, so a row without them
+        is a failed lookup, not an answer. Re-fetch the organism of those
+        accessions and the lineage of those organisms (including negatives
+        cached earlier) and rewrite the rows that now resolve.
+        Returns (rows repaired, rows still unresolved)."""
+        n_blast = 13   # Hit_rank + 12 BLAST columns
+        try:
+            with open(tsv_path, encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            return 0, 0
+        if len(lines) < 2:
+            return 0, 0
+
+        def _bad(fields):
+            return (len(fields) != n_blast + self._N_TAX_FIELDS + 1
+                    or not fields[-1].strip()
+                    or fields[n_blast] == self._TAX_NOT_FOUND)
+
+        rows = [l.split("\t") for l in lines[1:]]
+        bad = [i for i, f in enumerate(rows) if len(f) > 2 and _bad(f)]
+        if not bad:
+            return 0, 0
+        self.statusUpdated.emit(
+            "taxonomy", f"Taxonomy    │ Final check: {len(bad)} hit row(s) without "
+                        f"organism / lineage, fetching them again…")
+        accs = list(dict.fromkeys(rows[i][2] for i in bad if rows[i][2]))
+        with self._cache_lock:
+            for a in accs:
+                if not self._accdb.get(a):
+                    self._accdb.pop(a, None)
+        self._fetch_organisms_batch(accs)
+        orgs = list(dict.fromkeys(self._accdb.get(a, "") for a in accs if self._accdb.get(a)))
+        with self._cache_lock:
+            for o in orgs:
+                if self._taxadb.get(o) == self._TAX_NOT_FOUND:
+                    self._taxadb.pop(o, None)
+        if orgs and not self._stop:
+            self._fetch_taxonomy_batch(orgs)
+            self._retry_unresolved_taxonomy(orgs, "[final check] ")
+        n_fixed = n_still = 0
+        for i in bad:
+            f = rows[i]
+            org = self._accdb.get(f[2], "")
+            new = f[:n_blast] + self._tax_fields(org).split("\t") + [org]
+            if org and new[n_blast] != self._TAX_NOT_FOUND:
+                n_fixed += 1
+            else:
+                n_still += 1
+            rows[i] = new
+        tmp = tsv_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(lines[0] + "\n")
+                for f in rows:
+                    fh.write("\t".join(f) + "\n")
+            os.replace(tmp, tsv_path)
+        except OSError:
+            return 0, len(bad)
+        return n_fixed, n_still
+
     def _retry_unresolved_taxonomy(self, unique_orgs: List[str], prefix: str = ""):
         """Re-fetch only what failed TRANSIENTLY (network/stop) — never an
         organism NCBI already confirmed has no lineage, which re-asking cannot
@@ -2892,10 +3886,11 @@ class _BlastWorker(QtCore.QThread):
 
     # ── TSV → XLSX conversion ─────────────────────────────────────────────
 
-    def _tsv_to_xlsx(self, tsv_path: str) -> str:
-        """Convert *tsv_path* to a formatted xlsx. Returns xlsx path or '' on failure."""
+    def _tsv_to_xlsx(self, tsv_path: str, run_info: Optional[dict] = None) -> str:
+        """Convert *tsv_path* to a formatted xlsx (with its Summary and Best hit
+        sheets, see build_xlsx_from_tsv). Returns xlsx path or '' on failure."""
         try:
-            return build_xlsx_from_tsv(tsv_path)
+            return build_xlsx_from_tsv(tsv_path, run_info)
         except _XlsxBuildError as e:
             self.statusUpdated.emit("result", f"XLSX skip  │ {e}")
             return ""
@@ -2916,8 +3911,10 @@ class _BlastWorker(QtCore.QThread):
         exactly which sequences were really queried.
         """
         batch_fasta = "\n".join(h + "\n" + s for h, s in pairs)
-        rid, rtoe, reason = self._blast_submit(batch_fasta, label=batch_label)
-        if rid:
+        for restart in range(self._MAX_RESTARTS + 1):
+            rid, rtoe, reason = self._blast_submit(batch_fasta, label=batch_label)
+            if not rid:
+                break
             self.statusUpdated.emit(
                 "blast",
                 f"BLAST       │ [{batch_label}] RID={rid}  waiting {rtoe}s…"
@@ -2927,27 +3924,45 @@ class _BlastWorker(QtCore.QThread):
                     return [], []
                 time.sleep(1)
             ok, poll_reason = self._blast_poll(rid, batch_label)
+            stalled = (not ok) and poll_reason == self._STALLED
             if ok:
-                rows = self._blast_get_tabular(rid)
+                rows = self._blast_get_tabular(rid, batch_label)
                 if rows is not None:
                     return rows, pairs
                 if self._stop:
                     return [], []
-                # The search finished but its results could not be downloaded:
-                # mark the batch missing (so it can be re-run) instead of
-                # reporting its sequences as "no hits".
+                stalled = True
+            if not stalled:
+                reason = poll_reason
+                break
+            if self._stop:
+                return [], []
+            reason = self._STALLED
+            if restart < self._MAX_RESTARTS:
+                _ses = getattr(self, "_session", None)
+                if isinstance(_ses, dict):
+                    _ses["rid_restarts"] = _ses.get("rid_restarts", 0) + 1
                 self.statusUpdated.emit(
                     "blast",
-                    f"BLAST       │ [{batch_label}] results of RID {rid} could not be "
-                    f"downloaded — {len(pairs)} sequence(s) marked missing."
+                    f"BLAST       │ [{batch_label}] RID {rid} did not answer — "
+                    f"submitting again from scratch ({restart + 1}/{self._MAX_RESTARTS})…"
                 )
-                return [], []
-            reason = poll_reason
 
         if self._stop:
             return [], []
 
         n = len(pairs)
+        if reason == self._STALLED:
+            # Every RID of this batch went silent: do not split it (that
+            # multiplies the waiting). Leave it for the final retry pass and,
+            # if it stalls again there, aside in the missing FASTA + report.
+            self._stalled_ids.update(h[1:] for h, _s in pairs)
+            self.statusUpdated.emit(
+                "blast",
+                f"BLAST       │ [{batch_label}] NCBI never delivered the results — "
+                f"{n} sequence(s) left for the final retry."
+            )
+            return [], []
         if n > self._MIN_SPLIT_SEQS and depth < self._MAX_SPLIT_DEPTH:
             half = -(-n // 2)  # ceil
             self.statusUpdated.emit(
@@ -2980,67 +3995,39 @@ class _BlastWorker(QtCore.QThread):
             import traceback
             self.taskError.emit(f"{e}\n{traceback.format_exc()}")
 
-    def _run_blast(self):
-        cfg       = self.cfg
-        nhits     = cfg["nhits"]
-        nseq      = cfg["nseq"]
-        run_start = datetime.datetime.now()
-        mydate    = run_start.strftime("%Y%m%d-%H%M%S")
+    _RUN_PARAMS = ("database", "program", "nhits", "nseq", "fetch_taxonomy",
+                   "tax_reference", "strip_suffix")
+
+    def _blast_headings(self, fetch_tax: bool) -> str:
+        cols = (
+            "Query_name\tSubject_accession.ver\tP_identity\tAlignment_length\t"
+            "Num_mismatches\tGap_opens\tQuery_start\tQuery_end\t"
+            "Subject_start\tSubject_end\tEvalue\tBit_score"
+        )
+        if fetch_tax:
+            cols += ("\tSubject_Kingdom\tSubject_Class\tSubject_Order\t"
+                     "Subject_Family\tSubject_Genus\tSubject_organism")
+        # Per-sample hit rank (1 = best hit) as the first column, so results can
+        # be filtered by rank (e.g. Hit_rank == 1 keeps only each sample's top hit).
+        return "Hit_rank\t" + cols
+
+    def _new_run(self, run_start) -> Optional[dict]:
+        """Set up the files of a new run. Returns the run context, or None
+        after reporting the error."""
+        cfg    = self.cfg
+        run_id = run_start.strftime("%Y%m%d-%H%M%S")
 
         # ── Output directory (passed from MainWindow dialog) ──
         output_dir = cfg["outdir"]
         os.makedirs(output_dir, exist_ok=True)
 
-        # ── Cache files stored alongside the output folder ──
-        taxadb_path = os.path.join(output_dir, "taxadb.dbx")
-        accdb_path  = os.path.join(output_dir, "accdb.dbx")
-        fetch_tax = cfg.get("fetch_taxonomy", True)
-        if fetch_tax:
-            self._preload_caches(output_dir)
-
         # ── Merge & normalize FASTA ──
         raw   = self._merge_fasta_files(self.files)
         fasta = self._to_single_line_fasta(raw)
-        seq_count = fasta.count("\n>") + (1 if fasta.startswith(">") else 0)
-
-        if seq_count == 0:
-            self.taskError.emit(
-                "No FASTA sequences found in the provided files."
-            )
-            return
-
-        # ── Split into batches ──
-        batches, batch_pairs_list = self._split_batches(fasta, nseq)
-        n_batches = len(batches)
-        # Query_name (header, no leading '>') of every sequence NCBI actually
-        # answered and whose hits reached the TSV. A batch that gets split on
-        # rejection (see _submit_batch_with_retry) can succeed only partially,
-        # so this is tracked per-sequence rather than per top-level batch index.
-        processed_headers: set = set()
-        # Query_name values with at least one hit written to the TSV. Sequences
-        # in processed_headers but absent here got no match from BLAST.
-        hit_queries: set = set()
-
-        # ── Summary line (fixed slot "info") ──
-        self.statusUpdated.emit(
-            "info",
-            f"Sequences: {seq_count}  │  Batches: {n_batches}"
-            f"  │  Hits/seq: {nhits}  │  DB: {cfg['database']}"
-        )
-
-        _blast_cols = (
-            "Query_name\tSubject_accession.ver\tP_identity\tAlignment_length\t"
-            "Num_mismatches\tGap_opens\tQuery_start\tQuery_end\t"
-            "Subject_start\tSubject_end\tEvalue\tBit_score"
-        )
-        headings = (
-            _blast_cols + "\tSubject_Kingdom\tSubject_Class\tSubject_Order\t"
-            "Subject_Family\tSubject_Genus\tSubject_organism"
-            if fetch_tax else _blast_cols
-        )
-        # Per-sample hit rank (1 = best hit) as the first column, so results can
-        # be filtered by rank (e.g. Hit_rank == 1 keeps only each sample's top hit).
-        headings = "Hit_rank\t" + headings
+        pairs = self._fasta_pairs(fasta)
+        if not pairs:
+            self.taskError.emit("No FASTA sequences found in the provided files.")
+            return None
 
         # ── Save the sequences that were queried ──
         # Same base name as the results, so the pair (FASTA + table) is what the
@@ -3048,8 +4035,8 @@ class _BlastWorker(QtCore.QThread):
         # BLAST table by file name. The text written is the normalised FASTA
         # actually submitted, so its headers are the Query_name values of the
         # table. It is written before the queries start, so it is there even if
-        # the run is stopped half way.
-        fasta_path = os.path.join(output_dir, f"blast-{mydate}.fa")
+        # the run is stopped half way — resuming the run reads it back.
+        fasta_path = os.path.join(output_dir, f"blast-{run_id}.fa")
         try:
             with open(fasta_path, "w", encoding="utf-8") as fa_fh:
                 fa_fh.write(fasta + "\n")
@@ -3060,11 +4047,11 @@ class _BlastWorker(QtCore.QThread):
                 "result", f"FASTA skip │ could not write sequences: {e}")
 
         # ── Open TSV for incremental writing ──
-        tsv_path = os.path.join(output_dir, f"blast-{mydate}.tsv")
+        tsv_path = os.path.join(output_dir, f"blast-{run_id}.tsv")
         for _attempt in range(10):
             try:
                 with open(tsv_path, "w", encoding="utf-8") as tsv_fh:
-                    tsv_fh.write(headings + "\n")
+                    tsv_fh.write(self._blast_headings(cfg.get("fetch_taxonomy", True)) + "\n")
                 break
             except PermissionError:
                 self.statusUpdated.emit(
@@ -3078,159 +4065,365 @@ class _BlastWorker(QtCore.QThread):
             self.taskError.emit(
                 f"Could not write output file (locked/permission denied):\n{tsv_path}"
             )
+            return None
+
+        state = {
+            "version":   self._STATE_VERSION,
+            "run_id":    run_id,
+            "files":     [os.path.abspath(f) for f in self.files],
+            "params":    {k: cfg.get(k) for k in self._RUN_PARAMS},
+            "processed": [],
+            "status":    "running",
+            "sessions":  [],
+        }
+        return {"state": state, "outdir": output_dir, "pairs": pairs,
+                "fasta_path": fasta_path, "tsv_path": tsv_path,
+                "hit_queries": set(), "hits_written": 0}
+
+    def _load_resume(self, path: str) -> Optional[dict]:
+        """Load an interrupted run to continue it in its own files.
+
+        `path` is the run's blast-<run_id>.state.json; the run's .fa and .tsv
+        are read from the same folder. The run's own parameters replace the
+        panel's, so the rows added now match the rest of the table; only the
+        API key is taken from the panel.
+        Returns the run context, or None after reporting the error.
+        """
+        folder = os.path.dirname(os.path.abspath(path))
+        m = re.fullmatch(r"blast-(\d{8}-\d{6})\.state\.json", os.path.basename(path))
+        if not m:
+            self.taskError.emit(
+                f"{os.path.basename(path)} is not the state file of a BLAST run.\n"
+                "Pick the blast-<date>.state.json in the run's folder.")
+            return None
+        try:
+            with open(path, encoding="utf-8") as fh:
+                state = json.load(fh)
+        except Exception as e:
+            self.taskError.emit(f"Could not read {os.path.basename(path)}: {e}")
+            return None
+
+        run_id     = m.group(1)
+        base       = os.path.join(folder, f"blast-{run_id}")
+        fasta_path = base + ".fa"
+        tsv_path   = base + ".tsv"
+        if not (os.path.isfile(fasta_path) and os.path.isfile(tsv_path)):
+            self.taskError.emit(
+                f"Cannot resume run {run_id}: its sequences "
+                f"({os.path.basename(fasta_path)}) and its table "
+                f"({os.path.basename(tsv_path)}) must still be in\n{folder}")
+            return None
+
+        with open(fasta_path, encoding="utf-8", errors="replace") as fh:
+            pairs = self._fasta_pairs(self._to_single_line_fasta(fh.read()))
+
+        # Queries already in the table, and how many rows it holds.
+        hit_queries, hits_written = set(), 0
+        with open(tsv_path, encoding="utf-8", errors="replace") as fh:
+            header = fh.readline().rstrip("\r\n").split("\t")
+            if "Query_name" not in header:
+                self.taskError.emit(f"{os.path.basename(tsv_path)} has no 'Query_name' column.")
+                return None
+            q_i = header.index("Query_name")
+            for line in fh:
+                fields = line.rstrip("\r\n").split("\t")
+                if len(fields) > q_i and fields[q_i]:
+                    hit_queries.add(fields[q_i])
+                    hits_written += 1
+
+        state.pop("pending", None)   # RID kept by earlier versions; never reused
+        for k, v in (state.get("params") or {}).items():
+            if v is not None:
+                self.cfg[k] = v
+        if not self.cfg.get("nseq"):
+            # Not recorded (a state written while the batch size was on
+            # Automatic): compute it from the run's own sequences.
+            self.cfg["nseq"] = auto_nseq([len(s) for _h, s in pairs])
+            state.setdefault("params", {})["nseq"] = self.cfg["nseq"]
+        # Hits per sequence / sequences per batch the user chose to change for
+        # the rest of the run (confirmed in the panel). Saved as the run's
+        # parameters from now on; the session records what changed.
+        changes = {}
+        for k, v in (self.cfg.pop("param_changes", None) or {}).items():
+            if k in ("nhits", "nseq") and v and v != self.cfg.get(k):
+                changes[k] = [self.cfg.get(k), v]
+                self.cfg[k] = v
+                state.setdefault("params", {})[k] = v
+        self.cfg["outdir"] = folder
+        self.files = list(state.get("files") or [fasta_path])
+        return {"state": state, "outdir": folder, "pairs": pairs,
+                "fasta_path": fasta_path, "tsv_path": tsv_path,
+                "hit_queries": hit_queries, "hits_written": hits_written,
+                "changes": changes}
+
+    def _run_blast(self):
+        cfg       = self.cfg
+        run_start = datetime.datetime.now()
+        resuming  = bool(cfg.get("resume"))
+
+        ctx = self._load_resume(cfg["resume"]) if resuming else self._new_run(run_start)
+        if ctx is None:
             return
+        nhits      = cfg["nhits"]
+        nseq       = cfg["nseq"]
+        fetch_tax  = cfg.get("fetch_taxonomy", True)
+        state      = ctx["state"]
+        mydate     = state["run_id"]
+        output_dir = ctx["outdir"]
+        fasta_path = ctx["fasta_path"]
+        tsv_path   = ctx["tsv_path"]
+        all_pairs  = ctx["pairs"]
+        seq_count  = len(all_pairs)
+        # Query_name values with at least one hit written to the TSV. Sequences
+        # in self._processed but absent here got no match from BLAST.
+        hit_queries: set = ctx["hit_queries"]
+        total_hits_done: int = ctx["hits_written"]
 
-        total_hits_done: int = 0
-        total_expected = n_batches * self._BATCH_UNITS
+        # self._processed: Query_name (header, no leading '>') of every sequence
+        # NCBI actually answered and whose hits reached the TSV. A batch that
+        # gets split on rejection (see _submit_batch_with_retry) can succeed
+        # only partially, so this is tracked per sequence, not per batch.
+        self._state      = state
+        self._state_path = os.path.join(output_dir, f"blast-{mydate}.state.json")
+        # Sequences with rows in the table are done even if the state file
+        # missed them (e.g. the app closed between a batch and its save), so
+        # resuming never searches them again and duplicates their rows.
+        self._processed  = set(state.get("processed") or []) | hit_queries
+        self._session_t0 = time.monotonic()
+        self._session    = {"start": run_start.strftime("%Y-%m-%d %H:%M:%S"),
+                            "elapsed_s": 0, "status": "running"}
+        if ctx.get("changes"):
+            self._session["changes"] = ctx["changes"]
+        state.setdefault("sessions", []).append(self._session)
+        self._save_state("running")
 
-        for batch_idx, batch_fasta in enumerate(batches):
-            if self._stop:
-                break
+        # ── Cache files stored alongside the output folder ──
+        taxadb_path = os.path.join(output_dir, "taxadb.dbx")
+        accdb_path  = os.path.join(output_dir, "accdb.dbx")
+        if fetch_tax:
+            self._preload_caches(output_dir)
 
-            batch_pairs = batch_pairs_list[batch_idx]
-            batch_seq   = len(batch_pairs)
-            batch_label = f"Batch {batch_idx+1}/{n_batches}"
-            batch_base  = batch_idx * self._BATCH_UNITS
+        # ── Batches: every sequence not yet in the table ──
+        # On resume these always go out as new searches (new RIDs): a search
+        # left at NCBI by the stopped run is never waited for or reused — a
+        # RID can stay WAITING for good, and a run is often stopped because
+        # one did.
+        to_search = [p for p in all_pairs if p[0][1:] not in self._processed]
+        batch_pairs_list = self._plan_batches(to_search, nseq)
+        n_batches = len(batch_pairs_list)
 
-            # ── BLAST (auto-retries as smaller sub-batches if NCBI rejects it) ──
+        # ── Summary line (fixed slot "info") ──
+        seq_info = (f"Resuming: {len(to_search)}/{seq_count} seqs left" if resuming
+                    else f"Sequences: {seq_count}")
+        # Repeated headers share one Query_name: their hits end up mixed.
+        repeats = repeated_headers([h[1:] for h, _s in all_pairs])
+        self.statusUpdated.emit(
+            "info",
+            f"{seq_info}  │  Batches: {n_batches}"
+            f"  │  Hits/seq: {nhits}  │  DB: {cfg['database']}"
+            + (f"  │  ⚠ {len(repeats)} repeated header(s)" if repeats else "")
+        )
+        if resuming and not batch_pairs_list:
             self.statusUpdated.emit(
-                "blast",
-                f"BLAST       │ [{batch_label}] Submitting {batch_seq} sequences…"
-            )
-            blast_rows, used_pairs = self._submit_batch_with_retry(batch_pairs, batch_label)
-            if self._stop:
-                break
-            self._emit_progress(batch_base + 400, total_expected)
-            if not used_pairs:
-                continue  # every split down to the floor was rejected; already logged
+                "blast", "BLAST       │ Every sequence of this run was already searched.")
+        elif ctx.get("changes"):
+            self.statusUpdated.emit("blast", "BLAST       │ From now on: " + self._changes_text(ctx["changes"]))
 
-            self.statusUpdated.emit(
-                "blast",
-                f"BLAST       │ [{batch_label}] {len(blast_rows)} hits retrieved  ✓"
-            )
-
-            if fetch_tax:
-                # ── Fetch organisms (batch: one POST for all accessions) ──
-                accessions = [
-                    (row.split("\t")[1] if "\t" in row else "") for row in blast_rows
-                ]
-                unique_accs   = list(dict.fromkeys(a for a in accessions if a))
-                n_unique_accs = len(unique_accs)
-                self.statusUpdated.emit(
-                    "organism",
-                    f"Organism ID │ [{batch_label}] Fetching {n_unique_accs} accessions…"
-                )
-                self._fetch_organisms_batch(unique_accs)
+        def _run_batches(plist, tag):
+            """Search a list of batches and append their hits to the table."""
+            nonlocal total_hits_done
+            n_batches = len(plist)
+            total_expected = n_batches * self._BATCH_UNITS
+            for batch_idx, batch_pairs in enumerate(plist):
                 if self._stop:
                     break
-                n_org_found = sum(1 for a in unique_accs if a in self._accdb)
-                self.statusUpdated.emit(
-                    "organism",
-                    f"Organism ID │ [{batch_label}] {n_org_found}/{n_unique_accs} resolved  ✓"
-                )
-                self._emit_progress(batch_base + 600, total_expected)
 
-                organisms: List[str] = [
-                    (self._accdb.get(acc, "") if acc else "") for acc in accessions
-                ]
+                batch_seq   = len(batch_pairs)
+                batch_label = f"{tag}{batch_idx+1}/{n_batches}"
+                batch_base  = batch_idx * self._BATCH_UNITS
 
-                # ── Fetch taxonomy (batch: one POST per 500 taxids) ───────
-                unique_orgs   = list(dict.fromkeys(o for o in organisms if o))
-                n_unique_orgs = len(unique_orgs)
+                # ── BLAST (auto-retries as smaller sub-batches if NCBI rejects it) ──
                 self.statusUpdated.emit(
-                    "taxonomy",
-                    f"Taxonomy    │ [{batch_label}] Fetching {n_unique_orgs} organisms…"
+                    "blast",
+                    f"BLAST       │ [{batch_label}] Submitting {batch_seq} sequences…"
                 )
-                self._fetch_taxonomy_batch(unique_orgs)
+                blast_rows, used_pairs = self._submit_batch_with_retry(batch_pairs, batch_label)
                 if self._stop:
                     break
+                self._emit_progress(batch_base + 400, total_expected)
+                if not used_pairs:
+                    continue  # every split down to the floor was rejected; already logged
 
-                # ── Retry organisms whose lookup failed transiently ───────
-                self._retry_unresolved_taxonomy(unique_orgs, f"[{batch_label}] ")
-
-                n_tax_found = sum(
-                    1 for o in unique_orgs
-                    if self._taxadb.get(o, "Not_found_in_Taxonomy") != "Not_found_in_Taxonomy"
-                )
                 self.statusUpdated.emit(
-                    "taxonomy",
-                    f"Taxonomy    │ [{batch_label}] {n_tax_found}/{n_unique_orgs} resolved  ✓"
+                    "blast",
+                    f"BLAST       │ [{batch_label}] {len(blast_rows)} hits retrieved  ✓"
                 )
-                self._emit_progress(batch_base + 800, total_expected)
 
-                taxonomies: List[str] = [
-                    (self._taxadb.get(o, "Not_found_in_Taxonomy") if o else "Not_found_in_Taxonomy")
-                    for o in organisms
-                ]
+                if fetch_tax:
+                    # ── Fetch organisms (batch: one POST for all accessions) ──
+                    accessions = [
+                        (row.split("\t")[1] if "\t" in row else "") for row in blast_rows
+                    ]
+                    unique_accs   = list(dict.fromkeys(a for a in accessions if a))
+                    n_unique_accs = len(unique_accs)
+                    self.statusUpdated.emit(
+                        "organism",
+                        f"Organism ID │ [{batch_label}] Fetching {n_unique_accs} accessions…"
+                    )
+                    self._fetch_organisms_batch(unique_accs)
+                    if self._stop:
+                        break
+                    n_org_found = sum(1 for a in unique_accs if a in self._accdb)
+                    self.statusUpdated.emit(
+                        "organism",
+                        f"Organism ID │ [{batch_label}] {n_org_found}/{n_unique_accs} resolved  ✓"
+                    )
+                    self._emit_progress(batch_base + 600, total_expected)
 
-                batch_rows_out = self._rank_rows([
-                    f"{row}\t{tax}\t{org}"
-                    for row, tax, org in zip(blast_rows, taxonomies, organisms)
-                ])
+                    organisms: List[str] = [
+                        (self._accdb.get(acc, "") if acc else "") for acc in accessions
+                    ]
 
-                # ── Persist only new entries after every batch ──
-                # Exclude _tax_unconfirmed: negatives from a failed efetch are kept
-                # in memory for the in-run retry but must not poison taxadb.dbx.
+                    # ── Fetch taxonomy (batch: one POST per 500 taxids) ───────
+                    unique_orgs   = list(dict.fromkeys(o for o in organisms if o))
+                    n_unique_orgs = len(unique_orgs)
+                    self.statusUpdated.emit(
+                        "taxonomy",
+                        f"Taxonomy    │ [{batch_label}] Fetching {n_unique_orgs} organisms…"
+                    )
+                    self._fetch_taxonomy_batch(unique_orgs)
+                    if self._stop:
+                        break
+
+                    # ── Retry organisms whose lookup failed transiently ───────
+                    self._retry_unresolved_taxonomy(unique_orgs, f"[{batch_label}] ")
+
+                    n_tax_found = sum(
+                        1 for o in unique_orgs
+                        if self._taxadb.get(o, "Not_found_in_Taxonomy") != "Not_found_in_Taxonomy"
+                    )
+                    self.statusUpdated.emit(
+                        "taxonomy",
+                        f"Taxonomy    │ [{batch_label}] {n_tax_found}/{n_unique_orgs} resolved  ✓"
+                    )
+                    self._emit_progress(batch_base + 800, total_expected)
+
+                    taxonomies: List[str] = [self._tax_fields(o) for o in organisms]
+
+                    batch_rows_out = self._rank_rows([
+                        f"{row}\t{tax}\t{org}"
+                        for row, tax, org in zip(blast_rows, taxonomies, organisms)
+                    ])
+
+                    # ── Persist only new entries after every batch ──
+                    # Exclude _tax_unconfirmed: negatives from a failed efetch are kept
+                    # in memory for the in-run retry but must not poison taxadb.dbx.
+                    with self._cache_lock:
+                        new_tax = {k: self._taxadb[k] for k in self._taxadb
+                                   if k not in self._saved_tax_keys
+                                   and k not in self._tax_unconfirmed}
+                        new_acc = {k: self._accdb[k]  for k in self._accdb  if k not in self._saved_acc_keys}
+                        self._append_cache(new_tax, taxadb_path)
+                        self._append_cache(new_acc,  accdb_path)
+                        self._saved_tax_keys.update(new_tax.keys())
+                        self._saved_acc_keys.update(new_acc.keys())
+
+                else:
+                    batch_rows_out = self._rank_rows(blast_rows)
+
+                # ── Append batch rows to disk immediately ──
+                row_phase_start = 800 if fetch_tax else 400
+                row_phase_range = 200 if fetch_tax else 600
+                n_batch_rows = max(len(batch_rows_out), 1)
+                _batch_written = False
+                for _attempt in range(20):   # retry up to 10 s if TSV is open in Excel
+                    try:
+                        with open(tsv_path, "a", encoding="utf-8") as tsv_fh:
+                            for row_idx, r in enumerate(batch_rows_out, 1):
+                                tsv_fh.write(r + "\n")
+                                self._emit_progress(
+                                    batch_base + row_phase_start + int(row_phase_range * row_idx / n_batch_rows),
+                                    total_expected
+                                )
+                        _batch_written = True
+                        break  # write succeeded
+                    except PermissionError:
+                        self.statusUpdated.emit(
+                            "result",
+                            f"⚠ TSV file is open — close it and the run will resume… ({_attempt + 1}/20)"
+                        )
+                        self._interruptible_sleep(0.5)
+
+                # Solo marcar como procesadas las secuencias cuyas filas llegaron al disco;
+                # de lo contrario deben aparecer en el FASTA de "missing". used_pairs es
+                # el subconjunto de batch_pairs que NCBI realmente respondio (puede ser
+                # parcial si _submit_batch_with_retry tuvo que dividir el lote).
+                if _batch_written:
+                    total_hits_done += len(batch_rows_out)
+                    self._processed.update(h[1:] for h, _s in used_pairs)
+                    # Field 0 is Hit_rank and field 1 is Query_name (see `headings`),
+                    # which is the FASTA header of the query without the leading '>'.
+                    for _r in batch_rows_out:
+                        _fields = _r.split("\t")
+                        if len(_fields) > 1:
+                            hit_queries.add(_fields[1])
+                    self._save_state()
+
+        _run_batches(batch_pairs_list, "Batch ")
+
+        # ── Final retry pass ──
+        # A sequence with no hit, or whose batch failed, is searched once more
+        # in a batch of its own at the end: an empty answer from NCBI can be
+        # transient (overload, a job dropped server-side), and every sequence
+        # of a barcode marker is expected to hit something in core_nt.
+        n_retried = n_rescued = 0
+        if not self._stop:
+            retry_pairs = [p for p in all_pairs if p[0][1:] not in hit_queries]
+            if retry_pairs:
+                n_retried = len(retry_pairs)
+                had = set(hit_queries)
+                self.statusUpdated.emit(
+                    "blast", f"BLAST       │ Final retry: searching again {n_retried} "
+                             f"sequence(s) without hits or from failed batches…")
+                _run_batches(self._plan_batches(retry_pairs, nseq), "Retry ")
+                n_rescued = len(set(hit_queries) - had)
+                self.statusUpdated.emit(
+                    "blast", f"BLAST       │ Final retry: {n_rescued}/{n_retried} "
+                             f"now with hits  ✓")
+
+        # ── Final taxonomy check: rows without organism / lineage ──
+        n_tax_fixed = n_tax_still = 0
+        if fetch_tax and not self._stop and total_hits_done > 0:
+            n_tax_fixed, n_tax_still = self._repair_taxonomy_rows(tsv_path)
+            if n_tax_fixed or n_tax_still:
+                self.statusUpdated.emit(
+                    "taxonomy", f"Taxonomy    │ Final check: {n_tax_fixed} row(s) repaired"
+                                + (f", {n_tax_still} still unresolved" if n_tax_still else "")
+                                + "  ✓")
                 with self._cache_lock:
                     new_tax = {k: self._taxadb[k] for k in self._taxadb
                                if k not in self._saved_tax_keys
                                and k not in self._tax_unconfirmed}
-                    new_acc = {k: self._accdb[k]  for k in self._accdb  if k not in self._saved_acc_keys}
+                    new_acc = {k: self._accdb[k] for k in self._accdb
+                               if k not in self._saved_acc_keys and self._accdb[k]}
                     self._append_cache(new_tax, taxadb_path)
-                    self._append_cache(new_acc,  accdb_path)
+                    self._append_cache(new_acc, accdb_path)
                     self._saved_tax_keys.update(new_tax.keys())
                     self._saved_acc_keys.update(new_acc.keys())
 
-            else:
-                batch_rows_out = self._rank_rows(blast_rows)
-
-            # ── Append batch rows to disk immediately ──
-            row_phase_start = 800 if fetch_tax else 400
-            row_phase_range = 200 if fetch_tax else 600
-            n_batch_rows = max(len(batch_rows_out), 1)
-            _batch_written = False
-            for _attempt in range(20):   # retry up to 10 s if TSV is open in Excel
-                try:
-                    with open(tsv_path, "a", encoding="utf-8") as tsv_fh:
-                        for row_idx, r in enumerate(batch_rows_out, 1):
-                            tsv_fh.write(r + "\n")
-                            self._emit_progress(
-                                batch_base + row_phase_start + int(row_phase_range * row_idx / n_batch_rows),
-                                total_expected
-                            )
-                    _batch_written = True
-                    break  # write succeeded
-                except PermissionError:
-                    self.statusUpdated.emit(
-                        "result",
-                        f"⚠ TSV file is open — close it and the run will resume… ({_attempt + 1}/20)"
-                    )
-                    self._interruptible_sleep(0.5)
-
-            # Solo marcar como procesadas las secuencias cuyas filas llegaron al disco;
-            # de lo contrario deben aparecer en el FASTA de "missing". used_pairs es
-            # el subconjunto de batch_pairs que NCBI realmente respondio (puede ser
-            # parcial si _submit_batch_with_retry tuvo que dividir el lote).
-            if _batch_written:
-                total_hits_done += len(batch_rows_out)
-                processed_headers.update(h[1:] for h, _s in used_pairs)
-                # Field 0 is Hit_rank and field 1 is Query_name (see `headings`),
-                # which is the FASTA header of the query without the leading '>'.
-                for _r in batch_rows_out:
-                    _fields = _r.split("\t")
-                    if len(_fields) > 1:
-                        hit_queries.add(_fields[1])
-
         # ── Build missing-sequences FASTA (unprocessed or failed batches) ──
-        missing_pairs = []
-        for bp in batch_pairs_list:
-            for h, s in bp:
-                if h[1:] not in processed_headers:
-                    missing_pairs.append((h, s))
+        # Over the whole run, so after a resume it lists what is still left.
+        missing_pairs = [(h, s) for h, s in all_pairs if h[1:] not in self._processed]
+        # Sequences whose batch stalled at NCBI in this session, again in the
+        # final retry: set aside (they are in the missing FASTA too).
+        stalled_aside = [h[1:] for h, _s in missing_pairs
+                         if h[1:] in self._stalled_ids]
 
         miss_msg = ""
-        if missing_pairs:
-            miss_path = os.path.join(output_dir, f"missing_seqs_{mydate}.fa")
+        miss_path = os.path.join(output_dir, f"missing_seqs_{mydate}.fa")
+        if not missing_pairs:
+            self._remove_stale(miss_path)   # left by an earlier session of this run
+        else:
             try:
                 with open(miss_path, "w", encoding="utf-8") as fh:
                     for h, s in missing_pairs:
@@ -3246,15 +4439,14 @@ class _BlastWorker(QtCore.QThread):
         # Only actually-processed sequences are inspected: sequences of a
         # failed or unprocessed (sub-)batch were never really queried and are
         # already reported in the missing FASTA above.
-        nohit_pairs = []
-        for bp in batch_pairs_list:
-            for h, sq in bp:
-                if h[1:] in processed_headers and h[1:] not in hit_queries:
-                    nohit_pairs.append((h, sq))
+        nohit_pairs = [(h, sq) for h, sq in all_pairs
+                       if h[1:] in self._processed and h[1:] not in hit_queries]
 
         nohit_msg  = ""
         nohit_path = ""
-        if nohit_pairs:
+        if not nohit_pairs:
+            self._remove_stale(os.path.join(output_dir, f"nohit_seqs_{mydate}.fa"))
+        else:
             nohit_path = os.path.join(output_dir, f"nohit_seqs_{mydate}.fa")
             try:
                 with open(nohit_path, "w", encoding="utf-8") as fh:
@@ -3276,6 +4468,7 @@ class _BlastWorker(QtCore.QThread):
         # both are added in the same read/rewrite pass over the file.
         ref_msg = ""
         tax_match_msg = ""
+        ref_report: List[str] = []
         ref_path = cfg.get("tax_reference", "")
         if ref_path and not self._stop and total_hits_done > 0:
             try:
@@ -3288,18 +4481,40 @@ class _BlastWorker(QtCore.QThread):
                     ref_msg += f" · {len(unknown)} sample(s) not in the reference"
                 if n_match >= 0:
                     tax_match_msg = f"Tax_level_match added ({n_match} rows)"
+                _fmt = reference_format_warning(ref_table)
+                if _fmt:
+                    ref_msg += " · ⚠ " + _fmt
+                ref_report = reference_report_lines(
+                    {sample_id_of(q, cfg.get("strip_suffix", ""))
+                     for q in table_column(tsv_path, "Query_name") if q},
+                    ref_table, unknown=unknown)
             except Exception as exc:
                 ref_msg = f"Reference query taxonomy skipped: {exc}"
 
+        # ── Final state: whether (and why) this run can still be resumed ──
+        run_status = ("stopped" if self._stop
+                      else "incomplete" if missing_pairs else "completed")
+
         # ── Convert TSV → XLSX ──
         xlsx_path = ""
+        self._session["left_aside"] = len(stalled_aside)
+        self._session["elapsed_s"] = int(time.monotonic() - self._session_t0)
         if not self._stop and total_hits_done > 0:
-            xlsx_path = self._tsv_to_xlsx(tsv_path)
+            xlsx_path = self._tsv_to_xlsx(tsv_path, {
+                "kind": "search", "run_id": mydate, "files": list(self.files),
+                "params": {k: cfg.get(k) for k in self._RUN_PARAMS},
+                "processed": self._processed, "status": run_status,
+                "sessions": list(state.get("sessions") or []),
+                "fasta": fasta_path,
+            })
+
+        self._save_state(run_status)
+        resume_hint = "use Resume run… to finish it" if missing_pairs else ""
 
         extra_msgs = [m for m in (miss_msg, nohit_msg, ref_msg, tax_match_msg) if m]
         if self._stop:
             result_msg = (
-                "Stopped     │ " + "  │  ".join(extra_msgs)
+                "Stopped     │ " + "  │  ".join(extra_msgs + ([resume_hint] if resume_hint else []))
                 if extra_msgs else "Stopped by user."
             )
         else:
@@ -3307,7 +4522,8 @@ class _BlastWorker(QtCore.QThread):
             head = f"{total_hits_done} hits written"
             if not extra_msgs:
                 head += f" → {out_name}"
-            result_msg = "Done  ✓     │ " + "  │  ".join([head] + extra_msgs)
+            tail = [resume_hint] if resume_hint else []
+            result_msg = "Done  ✓     │ " + "  │  ".join([head] + extra_msgs + tail)
         self.statusUpdated.emit("result", result_msg)
 
         # ── Write run log ──────────────────────────────────────────────────
@@ -3325,8 +4541,9 @@ class _BlastWorker(QtCore.QThread):
         else:
             api_masked = "(not set)"
 
-        status_str = "Stopped" if self._stop else "Completed"
-        seqs_queried = len(processed_headers)
+        status_str = {"stopped": "Stopped", "incomplete": "Completed with missing sequences",
+                      "completed": "Completed"}[run_status]
+        seqs_queried = len(self._processed)
 
         log_lines = [
             "BLAST Run Log",
@@ -3334,6 +4551,20 @@ class _BlastWorker(QtCore.QThread):
             f"Date/Time  : {run_start.strftime('%Y-%m-%d %H:%M:%S')}",
             f"Status     : {status_str}",
             f"Total time : {elapsed_str}",
+            f"Run ID     : {mydate}",
+        ]
+        sessions = state.get("sessions") or []
+        if len(sessions) > 1:
+            # One line per session of a resumed run (this one included).
+            log_lines.append("Sessions   :")
+            for i, ses in enumerate(sessions, 1):
+                sec = int(ses.get("elapsed_s", 0))
+                line = (f"  {i}. {ses.get('start', '?')}  "
+                        f"{sec // 3600}h {sec % 3600 // 60:02d}m  {ses.get('status', '')}")
+                if ses.get("changes"):
+                    line += "  · " + self._changes_text(ses["changes"])
+                log_lines.append(line)
+        log_lines += [
             "",
             "Input files:",
         ]
@@ -3350,8 +4581,11 @@ class _BlastWorker(QtCore.QThread):
             f"  NCBI API key      : {api_masked}",
             "",
             "Results:",
-            f"  Sequences found   : {seq_count}",
-            f"  Sequences queried : {seqs_queried}/{seq_count} ({n_batches} batch(es) planned)",
+            f"  Sequences found   : {seq_count}"
+            + (f"  (⚠ {repeated_note(repeats)}: their hits share one Query_name)"
+               if repeats else ""),
+            f"  Sequences queried : {seqs_queried}/{seq_count}"
+            f" ({n_batches} batch(es) planned{' this session' if resuming else ''})",
             f"  Hits written      : {total_hits_done}",
             f"  Seqs with hits    : {len(hit_queries)}",
             f"  Seqs with no hits : {len(nohit_pairs)}",
@@ -3365,10 +4599,27 @@ class _BlastWorker(QtCore.QThread):
             log_lines.append(f"  Missing seqs      : {miss_msg}")
         if nohit_msg:
             log_lines.append(f"  No-hit seqs       : {nohit_msg}")
+        if n_retried:
+            log_lines.append(f"  Final retry       : {n_retried} seq(s) without hits or from "
+                             f"failed batches searched again · {n_rescued} now with hits"
+                             + (" (the rest are confirmed: no hit after retry)"
+                                if n_rescued < n_retried else ""))
+        if stalled_aside:
+            log_lines.append(
+                f"  Left aside        : {len(stalled_aside)} seq(s) whose search NCBI never "
+                f"delivered ({self._stall_max()} checks x {self._MAX_RESTARTS + 1} RIDs, also in the final "
+                f"retry) — listed in the missing FASTA; run Resume later")
+            for q in stalled_aside:
+                log_lines.append(f"    {q}")
+        if n_tax_fixed or n_tax_still:
+            log_lines.append(f"  Taxonomy check    : {n_tax_fixed} hit row(s) without organism / "
+                             f"lineage repaired · {n_tax_still} still unresolved")
         if ref_msg:
             log_lines.append(f"  Reference tax     : {ref_msg}")
         if tax_match_msg:
             log_lines.append(f"  Tax level match   : {tax_match_msg}")
+        if ref_report:
+            log_lines += ["", "Reference taxonomy:"] + ref_report
         if nohit_pairs:
             log_lines += ["", "Sequences with no BLAST hit:"]
             for h, _sq in nohit_pairs:
@@ -3482,11 +4733,14 @@ class _BlastFileWorker(_BlastWorker):
         self.statusUpdated.emit(
             "parse", f"Parse       │ Reading {len(self.files)} file(s)…")
         blast_rows: List[str] = []
+        file_queries = []   # (file, its Query_names) for the xlsx Summary
         for f in self.files:
             if self._stop:
                 break
             rows = self._read_hit_file(f)
             blast_rows.extend(rows)
+            file_queries.append(
+                (f, list(dict.fromkeys(r.split("	", 1)[0] for r in rows))))
             self.statusUpdated.emit(
                 "parse",
                 f"Parse       │ {os.path.basename(f)}: {len(rows)} hit row(s) kept"
@@ -3565,10 +4819,7 @@ class _BlastFileWorker(_BlastWorker):
                     self._saved_tax_keys.update(new_tax.keys())
                     self._saved_acc_keys.update(new_acc.keys())
 
-            taxonomies = [
-                (self._taxadb.get(o, "Not_found_in_Taxonomy") if o else "Not_found_in_Taxonomy")
-                for o in organisms
-            ]
+            taxonomies = [self._tax_fields(o) for o in organisms]
             ranked_rows = self._rank_rows([
                 f"{row}\t{tax}\t{org}"
                 for row, tax, org in zip(blast_rows, taxonomies, organisms)
@@ -3602,6 +4853,7 @@ class _BlastFileWorker(_BlastWorker):
         # Both are added in the same read/rewrite pass over the file.
         ref_msg = ""
         tax_match_msg = ""
+        ref_report: List[str] = []
         ref_path = cfg.get("tax_reference", "")
         if ref_path and ranked_rows and not self._stop:
             try:
@@ -3614,12 +4866,25 @@ class _BlastFileWorker(_BlastWorker):
                     ref_msg += f" · {len(unknown)} sample(s) not in the reference"
                 if n_match >= 0:
                     tax_match_msg = f"Tax_level_match added ({n_match} rows)"
+                _fmt = reference_format_warning(ref_table)
+                if _fmt:
+                    ref_msg += " · ⚠ " + _fmt
+                ref_report = reference_report_lines(
+                    {sample_id_of(q, cfg.get("strip_suffix", ""))
+                     for q in table_column(tsv_path, "Query_name") if q},
+                    ref_table, unknown=unknown)
             except Exception as exc:
                 ref_msg = f"Reference query taxonomy skipped: {exc}"
 
         xlsx_path = ""
         if ranked_rows and not self._stop:
-            xlsx_path = self._tsv_to_xlsx(tsv_path)
+            hit_params = {"nhits": nhits, "fetch_taxonomy": fetch_tax,
+                          "tax_reference": ref_path,
+                          "strip_suffix": cfg.get("strip_suffix", "")}
+            save_hit_table_info(tsv_path, file_queries, hit_params)
+            xlsx_path = self._tsv_to_xlsx(tsv_path, {
+                "kind": "hit_table", "inputs": file_queries, "params": hit_params,
+            })
         self._emit_progress(total_expected, total_expected)
 
         extra_msgs = [m for m in (ref_msg, tax_match_msg) if m]
@@ -3670,6 +4935,8 @@ class _BlastFileWorker(_BlastWorker):
             log_lines.append(f"  Reference tax     : {ref_msg}")
         if tax_match_msg:
             log_lines.append(f"  Tax level match   : {tax_match_msg}")
+        if ref_report:
+            log_lines += ["", "Reference taxonomy:"] + ref_report
         log_lines += [
             "",
             "NOTE: this tab does not produce a FASTA of queried sequences (the input",

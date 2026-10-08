@@ -14,9 +14,9 @@ The app opens a single window with six independent tools, listed in a sidebar:
 | Tool | What it does |
 | --- | --- |
 | **FASTQ Inspector** | Quality report of one or more FASTQ files or a whole `fastq_pass/` folder: read counts, length stats (N50), Phred quality, GC content, per-group breakdown, plots and PDF export. |
-| **FASTA Tools** | Nine operations on FASTA files: stats (with optional stop-codon check), unique / identical sequences, grep, header-field filters, append info from `.xlsx`, reformat, trim to coding ORF and multi-key sort. |
-| **FASTA Compare** | Compares multiFASTA files from different runs sample by sample and classifies each sample as identical / IUPAC-compatible / different / unique. |
-| **BLAST** | Online BLAST search against NCBI (API tab) or parsing of BLAST web result files (file tab), with taxonomy lookup, query-taxonomy reference and `Tax_level_match`. |
+| **FASTA Tools** | Operations on FASTA files: stats (with optional stop-codon check), extract sequences (unique, identical, grep, or by header fields with key names and AND/OR), append info from `.xlsx`, reformat, trim to coding ORF, multi-key sort and split (by count, size, length or header field). |
+| **FASTA Compare** | Compares multiFASTA files from different runs sample by sample and classifies each sample as identical / IUPAC-compatible / different / unique, with an ID match summary and an option to ignore length differences at the ends. |
+| **BLAST** | Online BLAST search against NCBI (API tab, resumable) or parsing of BLAST web result files (file tab), with taxonomy lookup, query-taxonomy reference, `Tax_level_match` and Summary / Best hit sheets in the results workbook. |
 | **GenBank Batch** | Batch search in GenBank (nucleotide) with up to two crossed criteria; returns record counts (CSV), metadata (XLSX) and sequences (FASTA). |
 | **BOLD Formatter** | Reformats the BOLD "Barcode ID" Excel workbook to the style of the BLAST results report. |
 
@@ -27,6 +27,10 @@ Databases). The sidebar can be collapsed to an icon rail (tool names show as
 tooltips) with the button at its bottom or **Ctrl+B**, and the light / dark theme
 is switched from the same place. Theme, sidebar state, the last open tool and the
 window geometry are remembered between sessions.
+
+A **?** next to each tool's title opens the matching section of the user guide in
+the browser. The mouse wheel scrolls the page without changing the numeric fields
+and drop-down lists under the cursor.
 
 ## Screenshots
 
@@ -82,6 +86,8 @@ read `.xlsx` files.
 ```
 barcodeSuite.py      entry point: main window and worker wiring
 suite_ui.py          sidebar, icons and light/dark theming
+guide/               user guide (HTML) and its screenshots
+tools/               make_screenshots.py regenerates guide/screenshots
 _utilities/          utility panels, shared verbatim with ONTbarcoder3
   genbank_batch.py   GenBank Batch (BarcodeSuite only)
 ```

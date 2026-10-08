@@ -278,12 +278,35 @@ class _RoundTooltips(QtCore.QObject):
 _TOOLTIP_FILTER = []
 
 
+class _NoWheelEdits(QtCore.QObject):
+    """Stops the mouse wheel from changing spin boxes, combo boxes and
+    sliders, so scrolling a page never edits the field under the cursor. The
+    event is ignored rather than eaten, so Qt passes it on to the parent
+    scroll area and the page still scrolls."""
+
+    _TYPES = (QtWidgets.QAbstractSpinBox, QtWidgets.QComboBox, QtWidgets.QAbstractSlider)
+
+    def eventFilter(self, obj, event):
+        if (event.type() == QtCore.QEvent.Wheel
+                and isinstance(obj, self._TYPES)
+                and not isinstance(obj, QtWidgets.QScrollBar)):
+            event.ignore()
+            return True
+        return False
+
+
+_WHEEL_FILTER = []
+
+
 def install_hooks():
     """Must run after QApplication exists and before any panel is built."""
     app = QtWidgets.QApplication.instance()
     if app is not None and not _TOOLTIP_FILTER:
         _TOOLTIP_FILTER.append(_RoundTooltips(app))
         app.installEventFilter(_TOOLTIP_FILTER[0])
+    if app is not None and not _WHEEL_FILTER:
+        _WHEEL_FILTER.append(_NoWheelEdits(app))
+        app.installEventFilter(_WHEEL_FILTER[0])
     QtWidgets.QWidget.setStyleSheet = _themed_set_ss
     QtWidgets.QTableWidgetItem.setBackground = _themed_set_bg
     QtWidgets.QTableWidgetItem.setForeground = _themed_set_fg
@@ -538,6 +561,7 @@ _ICON_PATHS = {
     "best":    '<path d="M12 3l2.6 5.6 6 .7-4.5 4.1 1.2 6L12 16.5 6.7 19.4l1.2-6L3.4 9.3l6-.7z"/>',
     "genbank": '<ellipse cx="12" cy="6" rx="8" ry="3"/><path d="M4 6v12c0 1.7 3.6 3 8 3s8-1.3 8-3V6"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
     "bold":    '<rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 10h18M9 10v10"/>',
+    "help":    '<circle cx="12" cy="12" r="9.5"/><path d="M9 9.5a3 3 0 1 1 4.5 2.6c-1 .6-1.5 1.1-1.5 2.2"/><circle cx="12" cy="17.4" r=".6"/>',
     "moon":    '<path d="M20 14.5A8 8 0 1 1 9.5 4a6.5 6.5 0 0 0 10.5 10.5z"/>',
     "sun":     '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M2 12h2M20 12h2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
     "collapse": '<path d="M11 17l-5-5 5-5M18 17l-5-5 5-5"/>',

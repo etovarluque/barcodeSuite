@@ -800,6 +800,8 @@ class GenbankBatchPanel(QtWidgets.QWidget):
         self._progress_bar.hide()
         status_layout.addWidget(self._progress_bar)
 
+        self._status_bar = status_bar
+        status_bar.hide()   # an empty band otherwise sits above the footer
         outer.addWidget(status_bar)
 
         # ── Log ──
@@ -1044,6 +1046,11 @@ class GenbankBatchPanel(QtWidgets.QWidget):
 
     # ── Run lifecycle ────────────────────────────────────────────────────
 
+    def _set_status(self, text: str):
+        """Show the status line (and its bar) only while it has text."""
+        self._status_lbl.setText(text)
+        self._status_bar.setVisible(bool(text))
+
     def _on_run_clicked(self):
         field1_terms = [ln for ln in self._field1_edit.toPlainText().splitlines() if ln.strip()]
         if not field1_terms:
@@ -1093,7 +1100,7 @@ class GenbankBatchPanel(QtWidgets.QWidget):
         self._progress_bar.setValue(0)
         self._progress_bar.show()
         self._status_lbl.setStyleSheet(f"color:{TEXT_SEC};")
-        self._status_lbl.setText(f"Starting search — {total_pairs} quer{'y' if total_pairs == 1 else 'ies'}…")
+        self._set_status(f"Starting search — {total_pairs} quer{'y' if total_pairs == 1 else 'ies'}…")
 
         self._worker = _GenbankBatchWorker(cfg)
         self._worker.progress.connect(self._on_progress)
@@ -1105,7 +1112,7 @@ class GenbankBatchPanel(QtWidgets.QWidget):
         self._worker.start()
 
     def _on_progress(self, text: str):
-        self._status_lbl.setText(text)
+        self._set_status(text)
 
     def _on_progress_pct(self, current: int, total: int):
         if total > 0 and self._progress_bar.maximum() != total:
@@ -1120,7 +1127,7 @@ class GenbankBatchPanel(QtWidgets.QWidget):
     def _stop_search(self):
         if self._worker and self._worker.isRunning():
             self._worker.stop()
-            self._status_lbl.setText("Stopping… (finishing current request)")
+            self._set_status("Stopping… (finishing current request)")
 
     def _retire_worker(self):
         """Detach the current worker so a late signal can't touch the UI, and keep a
@@ -1145,7 +1152,7 @@ class GenbankBatchPanel(QtWidgets.QWidget):
         self._progress_bar.hide()
         self._last_outdir = outdir
         self._status_lbl.setStyleSheet(f"color:{GREEN};")
-        self._status_lbl.setText(f"Done. Results saved in: {outdir}")
+        self._set_status(f"Done. Results saved in: {outdir}")
         if outdir and os.path.isdir(outdir):
             self._open_folder_btn.show()
 
@@ -1153,7 +1160,7 @@ class GenbankBatchPanel(QtWidgets.QWidget):
         self._set_running(False)
         self._progress_bar.hide()
         self._status_lbl.setStyleSheet(f"color:{RED};")
-        self._status_lbl.setText(f"Error: {msg}")
+        self._set_status(f"Error: {msg}")
         self._log_edit.show()
         self._log_edit.appendPlainText(f"ERROR: {msg}")
 
@@ -1173,7 +1180,7 @@ class GenbankBatchPanel(QtWidgets.QWidget):
         self._log_edit.clear()
         self._log_edit.hide()
         self._progress_bar.hide()
-        self._status_lbl.setText("")
+        self._set_status("")
         self._open_folder_btn.hide()
         self._last_outdir = ""
         self._set_run_enabled(False)

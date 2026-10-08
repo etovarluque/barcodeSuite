@@ -160,9 +160,15 @@ def main():
     # 08 dark theme, 09 collapsed sidebar
     w._switch_tool("fasta")
     w._toggle_theme()
+    sa = ft.findChild(QtWidgets.QScrollArea)
+    if sa is not None:
+        sa.verticalScrollBar().setValue(0)
     save(w, "08-dark-theme")
     w._toggle_theme()
     w._sidebar.set_collapsed(True)
+    wait(500)
+    if sa is not None:
+        sa.verticalScrollBar().setValue(0)
     save(w, "09-collapsed-sidebar")
 
     for k, v in saved.items():

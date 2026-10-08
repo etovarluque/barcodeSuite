@@ -56,7 +56,9 @@ def _check_and_install_pip():
             sys.exit(1)
 
 
-if not getattr(sys, "frozen", False):
+# Only in the main process: with "spawn" (Windows) every worker process of a
+# pool re-imports this script as __mp_main__ and would repeat the pip check.
+if __name__ == "__main__" and not getattr(sys, "frozen", False):
     # (import name, pip package name)
     _REQUIRED_PACKAGES = [
         ("PyQt5", "PyQt5"), ("edlib", "edlib"), ("xlsxwriter", "xlsxwriter"),
@@ -120,7 +122,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} {__version__}")
-        self.setMinimumSize(1200, 800)
+        # Never larger than the usable screen, or the window could not shrink
+        # to fit small / heavily scaled displays.
+        avail = QtWidgets.QApplication.primaryScreen().availableGeometry()
+        self.setMinimumSize(min(1200, avail.width()), min(800, avail.height()))
 
         self._panel_fastq_inspector = FastqInspectorPanel()
         self._panel_fasta_tools     = FastaToolsPanel()
@@ -161,6 +166,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._sidebar.set_collapsed(cfg.value("ui/sidebar_collapsed", False, type=bool))
         self._switch_tool(cfg.value("ui/current_tool", "fastq", type=str))
 
+        self._add_help_buttons()
         self._sidebar.toolSelected.connect(self._switch_tool)
         self._sidebar.themeToggled.connect(self._toggle_theme)
         self._sidebar.collapsedChanged.connect(
@@ -181,6 +187,109 @@ class MainWindow(QtWidgets.QMainWindow):
         desc = self._panel_blast._lbl_desc
         desc.setText(desc.text().replace(
             ", ready to use as a pair in Best Sequence.", "."))
+        fdesc = self._panel_blast._file_lbl_desc
+        fdesc.setText(fdesc.text().replace(
+            ", so the table cannot be paired in Best Sequence unless you "
+            "already have a matching FASTA under the same base name.", "."))
+
+    def _current_avail(self) -> QtCore.QRect:
+        scr = self.screen() or QtWidgets.QApplication.primaryScreen()
+        return scr.availableGeometry()
+
+    # ── Help icons ───────────────────────────────────────────────────────────
+
+    # panel -> (titles to find, user-guide section)
+    _HELP_TITLES = {
+        "fastq":   (("FASTQ Inspector",), "fastq"),
+        "fasta":   (("FASTA Tools",), "fasta-tools"),
+        "compare": (("Compare barcode sets",), "compare"),
+        "genbank": (("GenBank Batch Search",), "genbank"),
+        "bold":    (("BOLD Formatter",), "bold"),
+    }
+
+    def _add_help_buttons(self):
+        """A ? next to each panel title that opens the matching section of the
+        user guide."""
+        self._help_btns = []
+        for key, (titles, anchor) in self._HELP_TITLES.items():
+            for lbl in self._panels[key].findChildren(QtWidgets.QLabel):
+                if lbl.text().strip() in titles:
+                    self._wrap_title(lbl, anchor)
+        blast = self._panel_blast
+        for lbl in blast.findChildren(QtWidgets.QLabel):
+            text = lbl.text().strip()
+            if text == "BLAST API Search":
+                self._wrap_title(lbl, "blast-api")
+            elif text == "BLAST Web Results":
+                self._wrap_title(lbl, "blast-web")
+        self._refresh_help_icons()
+
+    def _wrap_title(self, lbl, anchor):
+        """Replace `lbl` in its layout by a row [label] [?]."""
+        layout = lbl.parentWidget().layout() if lbl.parentWidget() else None
+        if layout is None or layout.indexOf(lbl) < 0:
+            return False
+        row = QtWidgets.QWidget()
+        hl = QtWidgets.QHBoxLayout(row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(8)
+        layout.replaceWidget(lbl, row)
+        hl.addWidget(lbl)
+        btn = QtWidgets.QToolButton()
+        btn.setAutoRaise(True)
+        btn.setFixedSize(26, 26)
+        btn.setIconSize(QtCore.QSize(20, 20))
+        btn.setCursor(QtCore.Qt.PointingHandCursor)
+        btn.setToolTip("Open this section in the user guide")
+        btn.clicked.connect(lambda _=False, a=anchor: self._open_guide(a))
+        hl.addWidget(btn)
+        hl.addStretch(1)
+        self._help_btns.append(btn)
+        return True
+
+    def _refresh_help_icons(self):
+        color = suite_ui.tok("accent_fg")
+        hover_bg = suite_ui.tok("accent_tint")
+        for btn in self._help_btns:
+            btn.setIcon(suite_ui.make_icon("help", color, size=20))
+            btn.setStyleSheet(
+                "QToolButton { background: transparent; border: none; border-radius: 13px; }"
+                f"QToolButton:hover {{ background: {hover_bg}; }}"
+                f"QToolButton:pressed {{ background: {suite_ui.tok('accent')}; }}")
+
+    def _open_guide(self, anchor=""):
+        path = os.path.join(_get_base_dir(), "guide", "barcodeSuite_user_guide.html")
+        if not os.path.isfile(path):
+            QtWidgets.QMessageBox.warning(
+                self, "User guide", f"User guide not found:\n{path}")
+            return
+        url = QtCore.QUrl.fromLocalFile(path)
+        if anchor:
+            url.setFragment(anchor)
+        # The OS file-association launcher drops the #fragment of file URLs,
+        # so open a tiny temp page that redirects to the anchor instead.
+        if anchor and sys.platform.startswith("linux"):
+            try:
+                import webbrowser
+                if webbrowser.open(url.toString()):
+                    return
+            except Exception:
+                pass
+            url = QtCore.QUrl.fromLocalFile(path)
+        elif anchor:
+            try:
+                import tempfile
+                target = url.toString()
+                page = os.path.join(tempfile.gettempdir(), "barcodesuite_guide_jump.html")
+                with open(page, "w", encoding="utf-8") as fh:
+                    fh.write('<!doctype html><meta charset="utf-8">'
+                             f'<meta http-equiv="refresh" content="0;url={target}">'
+                             f'<script>location.replace("{target}")</script>'
+                             f'<a href="{target}">Open user guide</a>')
+                url = QtCore.QUrl.fromLocalFile(page)
+            except Exception:
+                pass
+        QtGui.QDesktopServices.openUrl(url)
 
     # ── Navigation / appearance ──────────────────────────────────────────────
 
@@ -195,6 +304,7 @@ class MainWindow(QtWidgets.QMainWindow):
         theme = "light" if current_theme() == "dark" else "dark"
         apply_theme(QtWidgets.QApplication.instance(), theme, STYLESHEET)
         self._sidebar.refresh()
+        self._refresh_help_icons()
         _settings().setValue("ui/theme", theme)
 
     def showEvent(self, event):
@@ -499,10 +609,20 @@ def main():
     if geom:
         win.restoreGeometry(geom)
     else:
-        win.resize(1450, 1020)
+        avail = win._current_avail()
+        win.resize(min(1450, avail.width()), min(1020, avail.height()))
 
     win.show()
-    sys.exit(app.exec_())
+    rc = app.exec_()
+    # Tear down Qt in a fixed order: left to the interpreter's shutdown,
+    # widgets and the QApplication are destroyed in arbitrary order and the
+    # process dies with an access violation, which Windows Error Reporting
+    # then holds for a few seconds before the console returns.
+    win.deleteLater()
+    del win
+    app.processEvents()
+    app.sendPostedEvents(None, QtCore.QEvent.DeferredDelete)
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

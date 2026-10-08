@@ -94,7 +94,7 @@ from _utilities.blast_panel import BlastPanel, _BlastWorker, _BlastFileWorker
 from _utilities.genbank_batch import GenbankBatchPanel
 from _utilities.bold_formatter import BoldFormatterPanel
 
-__version__ = "2.1.0"
+__version__ = "2.1.1"
 APP_NAME = "BarcodeSuite"
 
 # Sidebar layout: (section, [(tool key, label, icon), ...])
@@ -170,6 +170,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._panel_compare.compareRequested.connect(self._start_comparison)
         self._panel_blast.blastRequested.connect(self._start_blast)
+        self._panel_blast.resumeRequested.connect(self._resume_blast)
         self._panel_blast.blastFileRequested.connect(self._start_blast_file)
         # Best Sequence is not part of the Suite (it is tied to ONTbarcoder's
         # multi-run workflow): drop BLAST's hand-off button. blast_panel.py is
@@ -322,7 +323,7 @@ class MainWindow(QtWidgets.QMainWindow):
             pnl._result_lbl.setText(f"Error creating output folder: {e}")
             return
 
-        pnl._outdir_edit.setText(outdir)
+        pnl.set_outdir(outdir)
         pnl._result_lbl.setText(_tr("ComparePanel", "Comparison in progress…"))
         pnl._comp_bar.setRange(0, 0)
         pnl._comp_bar.show()
@@ -340,15 +341,19 @@ class MainWindow(QtWidgets.QMainWindow):
 
     # ── BLAST ────────────────────────────────────────────────────────────────
 
-    def _start_blast(self, files: list, cfg: dict):
-        pnl = self._panel_blast
+    def _blast_file_tab_idle(self) -> bool:
         # Both BLAST tabs keep their own NCBI rate limiter; running them at once
         # would double the request rate against the same IP (429s).
         other = getattr(self, "blast_file_worker", None)
         if other is not None and other.isRunning():
-            pnl.on_error(
+            self._panel_blast.on_error(
                 "The 'BLAST web results' tab is still running. Wait for it to "
                 "finish, or click its Stop button, before starting a new BLAST search.")
+            return False
+        return True
+
+    def _start_blast(self, files: list, cfg: dict):
+        if not self._blast_file_tab_idle():
             return
         outdir = self._ask_outdir("blast")
         if not outdir:
@@ -356,11 +361,23 @@ class MainWindow(QtWidgets.QMainWindow):
         try:
             os.makedirs(outdir, exist_ok=True)
         except Exception as e:
-            pnl.on_error(f"Could not create output folder: {e}")
+            self._panel_blast.on_error(f"Could not create output folder: {e}")
             return
         cfg["outdir"] = outdir
+        self._launch_blast_worker(files, cfg)
+
+    def _resume_blast(self, path: str, cfg: dict):
+        """Continue a stopped BLAST run in its own folder and files."""
+        if not self._blast_file_tab_idle():
+            return
+        cfg["resume"] = path
+        cfg["outdir"] = os.path.dirname(os.path.abspath(path))
+        self._launch_blast_worker([], cfg)
+
+    def _launch_blast_worker(self, files: list, cfg: dict):
+        pnl = self._panel_blast
         pnl.set_running(True)
-        pnl.update_status("result", f"Output    │ {outdir}")
+        pnl.update_status("result", f"Output    │ {cfg['outdir']}")
 
         try:
             pnl.stopRequested.disconnect()

@@ -109,7 +109,7 @@
 
 <aside>
   <div class="brand">Barcode<span>Suite</span>
-    <small>User Guide · v2.0.1</small>
+    <small>User Guide · v2.1.1</small>
   </div>
   <nav>
     <a href="#intro">Introduction</a>
@@ -285,7 +285,7 @@ turns amber and names the affected file(s).</p>
 
 <figure>
   <img src="screenshots/02-fasta-tools.png" alt="FASTA Tools">
-  <figcaption><b>Figure 4.</b> FASTA Tools with two files loaded and the <i>FASTA stats</i> operation selected.</figcaption>
+  <figcaption><b>Figure 4.</b> FASTA Tools with two files loaded, here with <b>Extract sequences → By header fields</b>: one criterion by key name (<code>ambs = 0</code>) and one by position.</figcaption>
 </figure>
 
 <div class="note"><b>Merge files before processing</b>
@@ -315,24 +315,29 @@ turns amber and names the affected file(s).</p>
           reports the frame with the fewest stops: the frame, the number of stops and their positions. A stop
           codon in a coding barcode (COI, rbcL, matK) points to a pseudogene (NUMT), an indel error or a
           wrong marker.</td></tr>
-  <tr><td><b>Extract unique sequences</b></td>
-      <td>Collapses duplicate sequences to one representative.
-          Output: <span class="pill out"><code>&lt;name&gt;_unique.fasta</code></span></td></tr>
-  <tr><td><b>Extract identical sequences (duplicates)</b></td>
-      <td>Writes the sequences that occur more than once, plus <code>_duplicate_groups.xlsx</code>, which groups
-          IDs by shared sequence (an <i>IDs</i> sheet and a <i>Groups</i> sheet).</td></tr>
-  <tr><td><b>Extract sequences by pattern (grep)</b></td>
-      <td>Keeps the sequences whose header matches a pattern. You can type the pattern, or load a
-          <code>.txt</code> file with one pattern per line, and optionally treat patterns as regular expressions.
-          By default a pattern matches anywhere in the header, so <code>DNS-1</code> also selects
-          <code>DNS-10</code>. For a list of IDs, turn on <b>Match whole ID</b>. It turns on automatically when
-          patterns are loaded from a file.</td></tr>
-  <tr><td><b>Filter sequences by header fields</b></td>
-      <td>Splits each header with a separator (<code>|</code>, <code>;</code> or a custom one) and keeps the
-          records that meet <b>all</b> the criteria you add (AND logic). Criteria are set by field position, with
-          the operators <code>=</code> <code>!=</code> <code>&gt;</code> <code>&lt;</code>
-          <code>&gt;=</code> <code>&lt;=</code> <code>contains</code> <code>not contains</code>. A preview
-          shows the fields of the first sequence.</td></tr>
+  <tr><td><b>Extract sequences</b></td>
+      <td>Keeps a subset of the sequences, in one of four ways chosen below the option:
+          <ul>
+            <li><b>Unique sequences</b>: collapses duplicates to one representative.
+                Output: <span class="pill out"><code>&lt;name&gt;_unique.fasta</code></span></li>
+            <li><b>Identical sequences (duplicates)</b>: writes the sequences that occur more than once, plus
+                <code>_duplicate_groups.xlsx</code>, which groups IDs by shared sequence (an <i>IDs</i> sheet
+                and a <i>Groups</i> sheet).</li>
+            <li><b>By pattern (grep)</b>: keeps the sequences whose header matches a pattern. You can type the
+                pattern, or load a <code>.txt</code> file with one pattern per line, and optionally treat
+                patterns as regular expressions. By default a pattern matches anywhere in the header, so
+                <code>DNS-1</code> also selects <code>DNS-10</code>. For a list of IDs, turn on
+                <b>Match whole ID</b>; it turns on automatically when patterns are loaded from a file.
+                <b>Ignore case</b> makes plain text, regex and whole-ID matching case-insensitive.</li>
+            <li><b>By header fields</b>: splits each header with a separator and keeps the records that meet
+                the criteria you add. Operators: <code>=</code> <code>!=</code> <code>&gt;</code>
+                <code>&lt;</code> <code>&gt;=</code> <code>&lt;=</code> <code>contains</code>
+                <code>not contains</code> (text comparisons ignore case). Each criterion picks its field by
+                <b>Position</b> (the Nth field) or by <b>Key name</b> for <code>key=value</code> fields (for
+                example <code>ambs</code>), wherever it sits in the header. <b>Combine criteria with</b>
+                <i>AND</i> (all must match) or <i>OR</i> (any can match). A header without the separator has
+                no fields and fails its criteria.</li>
+          </ul></td></tr>
   <tr><td><b>Append info to headers from .xlsx</b></td>
       <td>Adds fields from a spreadsheet to each header: column 1 = sequence ID, columns 2 onwards = fields to
           append, joined with the separator you choose. IDs and values are normalized: spaces, periods and
@@ -348,8 +353,26 @@ turns amber and names the affected file(s).</p>
   <tr><td><b>Sort sequences</b></td>
       <td>Sorts by the whole header or by header fields. You can add several sort levels (multi-key sort,
           each ascending or descending).</td></tr>
+  <tr><td><b>Split FASTA file</b></td>
+      <td>Splits each file (or the merged set) into several FASTA files, written to a
+          <code>&lt;name&gt;_split</code> folder. Every sequence goes to exactly one file and sequences are
+          never cut. Four ways:
+          <ul>
+            <li><b>By number of sequences</b>: files of <i>N</i> sequences (<code>&lt;name&gt;_part01.fasta</code>,
+                <code>_part02</code>…; the last may hold fewer), for example batches for BLAST on the NCBI website.</li>
+            <li><b>Into a number of files</b>: <i>N</i> files of near-equal size.</li>
+            <li><b>By total length</b>: consecutive files of at most <i>N</i> bases (1,000,000 is NCBI's limit per
+                blastn query; a single longer sequence gets a file of its own).</li>
+            <li><b>By header field</b>: one file per distinct value of a header field (by position or key name), named
+                after it. Unlike <i>Extract</i>, it needs no values and leaves no sequence out: headers without the
+                field go to <code>&lt;name&gt;_no_field.fasta</code>. The preview counts the files it would write, and
+                more than 100 files ask for confirmation.</li>
+          </ul></td></tr>
   </tbody>
 </table>
+
+<p><b>Field separators.</b> Filter, Sort and Split share one drop-down: <code>|</code>, <code>;</code>, <code>,</code>,
+space, tab, <code>_</code>, <code>-</code> or <b>Custom…</b> (Sort also offers <i>None (whole header)</i>).</p>
 
 <h4>How sequence IDs are matched (Append info · Match whole ID)</h4>
 <p>Both operations need an ID for each sequence. The ID is the header text before the first separator
@@ -358,6 +381,12 @@ chosen in <b>ID = header text before first</b>: <code>;</code> (the default, for
 of the ID. For example, <code>&gt;DNS-1_all.fa;758;807</code> with <code>;</code> and suffix
 <code>_all.fa</code> gives <code>DNS-1</code>. A live preview shows the ID taken from the first header,
 and how many sequences match the spreadsheet or the pattern list.</p>
+
+<h4>Repeated headers and empty results</h4>
+<p>When a file (or the merge of several) has <b>repeated headers</b>, the log says so with a few examples. Different
+sequences under the same header cannot be told apart by the tools that read the result later, so give each its own
+header. An operation whose result has <b>no sequences</b> (a grep with no match, a filter that excludes everything)
+does not write an empty FASTA: the log notes <code>No sequences: &lt;name&gt; not written</code>.</p>
 
 <!-- ============================================================= -->
 <h2 id="compare">3 · FASTA Compare</h2>
@@ -389,6 +418,10 @@ reference. Each sample's sequences are aligned (edlib, global alignment) and cla
   <li><b>Compare sets with each other</b>: every sample ID shared by two or more files is compared across all of them.</li>
   <li><b>Compare against reference</b>: one file is the reference and the others are compared against it.</li>
 </ul>
+<p><b>Ignore length differences at the ends</b> compares only the region two barcodes share: when one is a trimmed
+version of the other (for example with and without primers), the extra bases at its ends are not counted as
+differences. Real differences inside the shared region are still reported, and the length difference keeps appearing
+in the <code>Length</code> column. Barcodes trimmed on opposite sides still count as different.</p>
 
 <h3>Sample ID extraction</h3>
 <p>Load the files first. The settings below the drop zone then show a live preview of the ID extracted
@@ -404,6 +437,11 @@ from a real header.</p>
     match across naming conventions: <i>lowercase</i>, <i>strip leading zeros</i>
     (<code>BIOUG00045 → BIOUG45</code>), or <i>strip (regex)</i>, e.g. <code>_S\d+$</code>.</li>
 </ul>
+<p>Below the ID preview, an <b>ID match summary</b> shows, before anything runs, the IDs found per file, repeated IDs,
+headers without the delimiter (in orange) and how many IDs the files share (in reference mode: how many reference IDs
+appear in the other files). <i>No IDs in common</i> (in red) means the delimiter or occurrence does not fit these
+headers. If the extraction maps two records of the same file to one ID, the one with the best quality is kept and the
+summary warns (<i>Repeated IDs merged</i>).</p>
 
 <h3>Results</h3>
 <figure>
@@ -427,7 +465,7 @@ then the highest coverage.</p>
   <thead><tr><th>File</th><th>Content</th></tr></thead>
   <tbody>
     <tr><td><code>summary.xlsx</code></td><td>Color-coded summary, plus a <b>Runs</b> sheet that explains each alias.</td></tr>
-    <tr><td><code>best_barcodes.fa</code></td><td>The best sequence for each sample.</td></tr>
+    <tr><td><code>best_barcodes.fa</code></td><td>The best sequence for each sample. Each FASTA is written only when it has sequences.</td></tr>
     <tr><td><code>identical.fa</code> · <code>compatible_iupac.fa</code> · <code>different.fa</code></td><td>Samples in each state.</td></tr>
     <tr><td><code>only_in_reference.fa</code> / <code>without_reference.fa</code></td><td>Reference mode only.</td></tr>
   </tbody>
@@ -481,13 +519,53 @@ and by GenBank Batch. The key is hidden on screen; <kbd>Show</kbd> / <kbd>Hide</
   <li>If NCBI rejects a batch, it is halved and retried automatically, down to 20 sequences or three halvings.</li>
   <li>Each search can wait up to 45 minutes; its status is checked once a minute. <kbd>Stop</kbd> takes effect
     within about 30 s.</li>
+  <li><b>Result checks per search</b> (2-30, default 5) sets how many times NCBI is asked for a search's result,
+    about one minute apart, before that search is abandoned and the same sequences are sent again with a new RID.
+    Every poll that is not <i>READY</i> counts, <i>WAITING</i> included. A batch is resubmitted from scratch up to
+    3 times; if it still stalls it is left for the <i>Final retry</i> and, if it stalls again, it is left aside (not
+    split) in <code>missing_seqs_&lt;ts&gt;.fa</code> and listed in the run log under <i>Left aside</i>.</li>
+  <li><b>Final retry and taxonomy check.</b> Sequences without hits, or from failed batches, are searched once more
+    at the end of the run. Every hit row without organism or lineage is looked up again and rewritten. The run log
+    reports both.</li>
   <li>Taxonomy and accession lookups are cached (<code>taxadb.dbx</code>, <code>accdb.dbx</code>) and reused in later runs.</li>
 </ul>
+<h4>Stopping and resuming a run</h4>
+<p>Each run keeps a small state file, <code>blast-&lt;ts&gt;.state.json</code>, next to its <code>.fa</code> and
+<code>.tsv</code>, updated after every batch. A stopped run, or one that finished with sequences in
+<code>missing_seqs_&lt;ts&gt;.fa</code>, can be finished later: press <b>Resume run…</b> (next to <b>Run BLAST</b>) and
+pick that <code>.state.json</code>. Only the sequences not yet in the table are searched, always as new searches (new
+RIDs). Their hits are appended to the <b>same</b> <code>.tsv</code>, and at the end the <code>.xlsx</code>, the
+query-taxonomy columns, <code>nohit_seqs</code> and the run log are rebuilt for the whole run, so the result is one
+table as if the run had never been interrupted. The run keeps its own database, program, taxonomy option and reference
+file; if <b>Hits per sequence</b> or the Manual batch size differ from the panel's, a dialog asks which to use.</p>
+<p><b>Repeated headers.</b> An amber line under the batch plan warns when the loaded FASTA files hold repeated
+headers: a repeated header is a single <code>Query_name</code> in the results, so the hits of its copies are mixed in
+the same rows. Give each sequence its own header before searching.</p>
+
 <div class="warn"><b>NCBI usage policy</b>
 NCBI limits each IP to <b>100 searches per 24&nbsp;h</b>; beyond that, your traffic moves to a slower queue or is
 blocked. Large batches can also be rejected silently for exceeding NCBI's CPU-time limit, which is why the default is
 100 sequences per search. Avoid running several sessions at once, and prefer off-peak hours for large
 projects. Your sequences are sent to a public service, so keep that in mind for unpublished data.</div>
+
+<h4>The Summary and Best hit sheets</h4>
+<p>The results <code>.xlsx</code> has three sheets: <b>Summary</b> (opens first), <b>Best hit</b> and
+<b>BLAST Results</b> (the hit table).</p>
+<ul>
+  <li><b>Summary</b> starts with key-figure cards and lists the input files with their sequence counts, the taxonomy
+    reference, the run parameters, the results (hit rows, sequences with and without hits), the
+    <b>identification level</b> (how many sequences were identified to organism, genus, family or order, with count,
+    % and text bars, overall and per input file), the best-hit identity bands, the sequences to review (low identity,
+    best hit that is not BLAST's first, no match with the reference) and the run (duration, sessions, searches sent
+    again, sequences left aside). Without a reference file there is no taxonomic level to count, and the sheet only
+    separates sequences with and without hits.</li>
+  <li><b>Best hit</b> has one row per sequence, sorted by name, with two extra columns on the left:
+    <code>Identification</code> (<code>organism</code>, <code>genus</code>, <code>family</code>, <code>order</code>,
+    <code>none</code>, <code>no_reference</code>, <code>blast_hit</code>, <code>no_hit</code> or
+    <code>not_searched</code>) and <code>Hits</code>. The row shown is the hit that agrees with the reference at the
+    deepest rank, not necessarily BLAST's first; ties are decided by bit score, identity, then fewest gap openings and
+    mismatches.</li>
+</ul>
 
 <h3>4.2 BLAST web results</h3>
 <p>Run BLAST yourself at <code>blast.ncbi.nlm.nih.gov</code>, export with <b>Download All → Hit Table(text)</b> or
@@ -511,6 +589,11 @@ Family, Genus and Organism:</p>
 <pre>Sample,Order,Family,Genus,Organism
 DNS-1343,Asterales,Asteraceae,Baccharis,Baccharis latifolia
 DNS-1400,Poales,Poaceae,Chusquea,Chusquea scandens</pre>
+<p><b>Reference check.</b> As soon as the reference file and the input are both loaded, a line under the file reports
+how many sample IDs of the input the reference knows (green when all are found, amber when only some are, red when
+none is). When IDs are missing only because of the separators used (for example <code>DNS-1343</code> in the data and
+<code>DNS_1343</code> in the reference), it says so with an example. A run whose input matches no reference ID asks
+for confirmation first. The same check appears in <b>Apply reference taxonomy</b> and in BOLD Formatter.</p>
 <p>If a run has both the hit taxonomy and the reference taxonomy, the table also gets
 <code>Tax_level_match</code>: the deepest rank at which the two agree (<code>organism</code>, <code>genus</code>,
 <code>family</code>, <code>order</code> or <code>none</code>).</p>
@@ -597,7 +680,9 @@ hit rows have no <code>Query ID</code>, a dialog lets you <b>Rename</b> them (<c
   <li><b>Hits to keep per Query ID</b> (default 5), or <b>Keep all hits</b>.</li>
   <li><b>I have a reference file with the query taxonomy</b>: the same reference table as in BLAST
     (<a href="#blast">§4.3</a>). It adds the <code>Query_*</code> columns and <code>Tax_level_match</code>, comparing
-    BOLD's Order / Family / Genus / Species with the expected taxonomy.</li>
+    BOLD's Order / Family / Genus / Species with the expected taxonomy. The <b>reference check</b> reports how many
+    <code>Query ID</code> sample IDs the reference knows as soon as both files are loaded, and after the run the log names the
+    samples missing from the reference or with empty taxonomy.</li>
 </ul>
 
 <h3>Output</h3>
@@ -625,7 +710,7 @@ taxonomy.</p>
 </div>
 
 <footer class="pg">
-  User guide for <b>BarcodeSuite 2.0.1</b> (<code>barcodeSuite.py</code>). The utilities are shared with ONTbarcoder3 3.6.0.
+  User guide for <b>BarcodeSuite 2.1.1</b> (<code>barcodeSuite.py</code>). The utilities are shared with ONTbarcoder3 3.7.1.
   Screenshots use synthetic demo data.
 </footer>
 
